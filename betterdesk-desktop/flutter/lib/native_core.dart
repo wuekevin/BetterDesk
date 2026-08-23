@@ -68,15 +68,24 @@ class NativeCore {
   final Pointer<Utf8> Function() _registrationStatus;
 
   static NativeCore? tryLoad() {
-    final names = Platform.isWindows
-        ? const ['betterdesk_desktop.dll']
-        : const ['libbetterdesk_desktop.so'];
+    final names = <String>[];
+    if (Platform.isWindows) {
+      names.add('betterdesk_desktop.dll');
+    } else if (Platform.isMacOS) {
+      final executable = File(Platform.resolvedExecutable);
+      final contents = executable.parent.parent;
+      names
+        ..add('${contents.path}/Frameworks/libbetterdesk_desktop.dylib')
+        ..add('libbetterdesk_desktop.dylib');
+    } else {
+      names.add('libbetterdesk_desktop.so');
+    }
     for (final name in names) {
       try {
         return NativeCore._(DynamicLibrary.open(name));
       } catch (_) {
         // The Flutter shell remains usable while running from source before
-        // the Rust library has been copied by build.py.
+        // the Rust library has been copied by the platform build script.
       }
     }
     return null;
