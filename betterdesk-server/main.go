@@ -7,6 +7,7 @@ import (
 	cryptoRand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -41,6 +42,11 @@ import (
 var (
 	Version   = "dev"
 	BuildDate = "unknown"
+
+	runSQLiteAuthConsolidation       bool
+	sqliteAuthConsolidationDryRun    bool
+	sqliteAuthConsolidationBackupDir string
+	sqliteAuthConsolidationRollback  string
 )
 
 func init() {
@@ -57,6 +63,31 @@ func main() {
 	// Configure log format (must be before any log output)
 	logCleanup := logging.Setup(cfg.LogFormat, cfg.LogLevel)
 	defer logCleanup()
+
+	if sqliteAuthConsolidationRollback != "" {
+		if err := db.RollbackSQLiteAuth(cfg.DBPath, sqliteAuthConsolidationRollback); err != nil {
+			log.Fatalf("SQLite auth consolidation rollback failed: %v", err)
+		}
+		log.Printf("SQLite auth consolidation rollback completed")
+		return
+	}
+	if runSQLiteAuthConsolidation {
+		report, err := db.ConsolidateSQLiteAuth(db.SQLiteAuthConsolidationOptions{
+			DBPath:     cfg.DBPath,
+			AuthDBPath: cfg.AuthDBPath,
+			BackupDir:  sqliteAuthConsolidationBackupDir,
+			DryRun:     sqliteAuthConsolidationDryRun,
+		})
+		if err != nil {
+			log.Fatalf("SQLite auth consolidation failed: %v", err)
+		}
+		encoded, err := json.Marshal(report)
+		if err != nil {
+			log.Fatalf("Encode SQLite auth consolidation report: %v", err)
+		}
+		fmt.Println(string(encoded))
+		return
+	}
 
 	log.Printf("========================================")
 	log.Printf("  BetterDesk Server %s", Version)
@@ -241,7 +272,7 @@ func main() {
 		log.Printf("========================================")
 	}
 
-    // Initialize per-IP relay connection limiter
+	// Initialize per-IP relay connection limiter
 	var connLimiter *ratelimit.ConnLimiter
 	if cfg.RelayMaxConnsIP > 0 {
 		connLimiter = ratelimit.NewConnLimiterFromInt(cfg.RelayMaxConnsIP)
@@ -365,7 +396,7 @@ func main() {
 		defer relaySrv.Stop()
 
 		apiSrv := api.New(cfg, database, sig.PeerMap(), relaySrv, Version)
-		defer attachPanelSync(apiSrv, billingSvc, database, cfg.AuthDBPath)()
+		defer attachPanelSync(apiSrv, billingSvc, database, cfg.DBPath, cfg.AuthDBPath)()
 		apiSrv.SetBlocklist(blocklist)
 		apiSrv.SetBandwidthLimiter(bwLimiter)
 		apiSrv.SetAuditLogger(auditLogger)
@@ -375,6 +406,15 @@ func main() {
 		apiSrv.SetKeyPair(kp)
 		apiSrv.SetTimeSyncService(timeSyncSvc)
 		apiSrv.SetBillingService(billingSvc)
+		vaultKey := cfg.OrgPeerVaultKey
+		if vaultKey == "" {
+			vaultKey = jwtSecret
+		}
+		if err := apiSrv.InitPeerCredentialVault(vaultKey); err != nil {
+			log.Printf("[warn] org peer credential vault disabled: %v", err)
+		} else {
+			log.Printf("Org peer credential vault ready (AES-GCM)")
+		}
 
 		// LDAP provider (loads config from DB, hot-reloadable via API)
 		apiSrv.InitLDAP()
@@ -388,6 +428,9 @@ func main() {
 			cdapGw.SetBlocklist(blocklist)
 			cdapGw.SetAuditLogger(auditLogger)
 			cdapGw.SetJWTManager(jwtManager)
+			if err := cdapGw.SetSessionGrantPrivateKey(kp.PrivateKey); err != nil {
+				log.Fatalf("Failed to configure CDAP session grant signer: %v", err)
+			}
 			cdapGw.SetVersion(Version)
 			apiSrv.SetCDAPGateway(cdapGw)
 		}
@@ -403,9 +446,22 @@ func main() {
 			meshGw.SetAuditLogger(auditLogger)
 			meshGw.SetJWTManager(jwtManager)
 			meshGw.SetVersion(Version)
-			if cfg.TLSCertFile != "" {
-				if certDER, readErr := os.ReadFile(cfg.TLSCertFile); readErr == nil {
-					meshGw.SetWebCertHash(meshcentral.WebCertHash(certDER))
+			// Web cert hash: MESH_WEB_CERT_FILE (public TLS agents see, e.g. proxy LE)
+			// takes priority over TLS_CERT (may be internal/signal-only).
+			webCertPath := cfg.MeshWebCertFile
+			if webCertPath == "" {
+				webCertPath = cfg.TLSCertFile
+			}
+			if webCertPath != "" {
+				if certBytes, readErr := os.ReadFile(webCertPath); readErr == nil {
+					if h := meshcentral.WebCertHash(certBytes); len(h) > 0 {
+						meshGw.SetWebCertHash(h)
+						log.Printf("[mesh] web cert hash loaded from %s", webCertPath)
+					} else {
+						log.Printf("[mesh] warning: could not parse web cert at %s — web hash validation skipped", webCertPath)
+					}
+				} else {
+					log.Printf("[mesh] warning: cannot read web cert %s: %v — web hash validation skipped", webCertPath, readErr)
 				}
 			}
 			apiSrv.SetMeshGateway(meshGw)
@@ -451,7 +507,7 @@ func main() {
 		defer sig.Stop()
 
 		apiSrv := api.New(cfg, database, sig.PeerMap(), nil, Version)
-		defer attachPanelSync(apiSrv, billingSvc, database, cfg.AuthDBPath)()
+		defer attachPanelSync(apiSrv, billingSvc, database, cfg.DBPath, cfg.AuthDBPath)()
 		apiSrv.SetBlocklist(blocklist)
 		apiSrv.SetBandwidthLimiter(bwLimiter)
 		apiSrv.SetAuditLogger(auditLogger)
@@ -459,6 +515,13 @@ func main() {
 		apiSrv.SetMetrics(mc)
 		apiSrv.SetJWTManager(jwtManager)
 		apiSrv.SetKeyPair(kp)
+		vaultKey := cfg.OrgPeerVaultKey
+		if vaultKey == "" {
+			vaultKey = jwtSecret
+		}
+		if err := apiSrv.InitPeerCredentialVault(vaultKey); err != nil {
+			log.Printf("[warn] org peer credential vault disabled: %v", err)
+		}
 		apiSrv.InitLDAP()
 		apiSrv.InitOIDC()
 		if err := apiSrv.Start(ctx); err != nil {
@@ -695,8 +758,9 @@ func resolveAuthDBPath(explicit, dbPath string) string {
 	return explicit
 }
 
-// attachPanelSync wires RustDesk group/folder sync to PostgreSQL or legacy auth.db.
-func attachPanelSync(apiSrv *api.Server, billingSvc *billing.Service, database db.Database, authDBPath string) func() {
+// attachPanelSync wires RustDesk group/folder sync to PostgreSQL, the
+// consolidated SQLite store, or a legacy auth.db during the migration window.
+func attachPanelSync(apiSrv *api.Server, billingSvc *billing.Service, database db.Database, primaryDBPath, authDBPath string) func() {
 	if pg, ok := database.(*db.PostgresDB); ok {
 		apiSrv.SetPanelStore(pg)
 		if billingSvc != nil {
@@ -704,6 +768,15 @@ func attachPanelSync(apiSrv *api.Server, billingSvc *billing.Service, database d
 		}
 		log.Printf("RustDesk panel sync: PostgreSQL (device groups, folders, ACL)")
 		return func() {}
+	}
+	if _, ok := database.(*db.SQLiteDB); ok {
+		consolidated, err := db.SQLiteAuthConsolidated(primaryDBPath)
+		if err != nil {
+			log.Printf("WARN: cannot determine SQLite consolidation state: %v", err)
+		} else if consolidated {
+			authDBPath = primaryDBPath
+			log.Printf("RustDesk panel sync: consolidated SQLite database")
+		}
 	}
 	if strings.TrimSpace(authDBPath) == "" {
 		log.Printf("WARN: no panel sync source — device groups/folders unavailable to RustDesk client")
@@ -744,6 +817,10 @@ func parseFlags() *config.Config {
 	flag.IntVar(&cfg.AdminPort, "admin-port", cfg.AdminPort, "TCP admin interface port (0 = disabled)")
 	flag.StringVar(&cfg.JWTSecret, "jwt-secret", cfg.JWTSecret, "JWT signing secret (auto-generated if empty)")
 	flag.IntVar(&cfg.JWTExpiry, "jwt-expiry", cfg.JWTExpiry, "JWT token expiry in hours (default 24)")
+	flag.BoolVar(&runSQLiteAuthConsolidation, "migrate-sqlite-auth", false, "Safely consolidate legacy auth.db into the selected SQLite DB, then exit")
+	flag.BoolVar(&sqliteAuthConsolidationDryRun, "migrate-sqlite-auth-dry-run", false, "Validate legacy auth.db consolidation without modifying databases")
+	flag.StringVar(&sqliteAuthConsolidationBackupDir, "migrate-sqlite-auth-backup-dir", "", "Directory for SQLite auth consolidation backups")
+	flag.StringVar(&sqliteAuthConsolidationRollback, "rollback-sqlite-auth", "", "Restore the selected SQLite DB from a consolidation snapshot, then exit")
 	flag.StringVar(&cfg.AdminPassword, "admin-password", cfg.AdminPassword, "Password for admin TCP interface")
 	flag.BoolVar(&cfg.ForceHTTPS, "force-https", cfg.ForceHTTPS, "Reject non-TLS API requests")
 	flag.BoolVar(&cfg.TrustProxy, "trust-proxy", cfg.TrustProxy, "Trust X-Forwarded-For/X-Real-IP headers from reverse proxy (requires --trusted-proxies)")

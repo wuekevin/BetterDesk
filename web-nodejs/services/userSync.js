@@ -48,6 +48,81 @@ function normalizeUsername(username) {
     return String(username || '').trim().toLowerCase();
 }
 
+/** Matches Go auth.IsSuperAdminRole / panel isSuperAdminRole (Discussion #99). */
+function isSuperAdminRole(role) {
+    return role === 'super_admin' || role === 'admin';
+}
+
+function usesSharedUserStore() {
+    if (db.type === 'postgres') return true;
+    try {
+        return typeof db.getAuthDb === 'function' && db.getAuthDb() === db.getDb();
+    } catch (_) {
+        return false;
+    }
+}
+
+function usesSharedSQLiteStore() {
+    return db.type === 'sqlite' && usesSharedUserStore();
+}
+
+/**
+ * Fetch Go users via API. Distinguishes empty list from API failure (Issue #315).
+ * @returns {Promise<{ users: object[], ok: boolean, status?: number, error?: string }>}
+ */
+async function listGoUsers() {
+    try {
+        const { data } = await apiClient.get('/users');
+        if (!Array.isArray(data)) {
+            return { users: [], ok: false, status: 502, error: 'invalid_go_users_payload' };
+        }
+        return { users: data, ok: true };
+    } catch (err) {
+        const status = err.response?.status;
+        console.warn(
+            `[userSync] listGoUsers failed: status=${status} ${err.message}` +
+            (status === 500
+                ? ' — Go user list broken; admin-delete parity check cannot run'
+                : '')
+        );
+        return { users: [], ok: false, status: status || 502, error: err.message };
+    }
+}
+
+/**
+ * Pre-flight for deleting a Super Admin on dual-SQLite installs (Issue #315).
+ * Shared PostgreSQL uses one users table — local countAdmins is enough.
+ *
+ * @param {string} username
+ * @returns {Promise<{ ok: boolean, status?: number, reason?: string, goAdminCount?: number }>}
+ */
+async function assertGoAllowsSuperAdminDelete(username) {
+    if (!username) return { ok: true, reason: 'no-username' };
+    if (usesSharedUserStore()) return { ok: true, reason: 'shared-db' };
+
+    const listed = await listGoUsers();
+    if (!listed.ok) {
+        return { ok: false, status: listed.status || 502, reason: 'go_users_unavailable' };
+    }
+
+    const lower = normalizeUsername(username);
+    const goUser = listed.users.find(u => normalizeUsername(u.username) === lower);
+    if (!goUser) {
+        // Panel-only row — nothing to mirror; local last-admin check still applies.
+        return { ok: true, reason: 'not-on-go', goAdminCount: listed.users.filter(u => isSuperAdminRole(u.role)).length };
+    }
+    if (!isSuperAdminRole(goUser.role)) {
+        return { ok: true, reason: 'not-go-super-admin' };
+    }
+
+    const goAdminCount = listed.users.filter(u => isSuperAdminRole(u.role)).length;
+    if (goAdminCount <= 1) {
+        // Node may have other super_admins that never mirrored — refuse before local delete.
+        return { ok: false, status: 409, reason: 'last_admin_go', goAdminCount };
+    }
+    return { ok: true, goAdminCount };
+}
+
 function sqliteTableExists(sqliteDb, tableName) {
     if (!/^[a-zA-Z0-9_]+$/.test(tableName)) return false;
     try {
@@ -210,21 +285,8 @@ function insertGoUserWithPasswordHash(username, passwordHash, role, authProvider
 }
 
 async function readGoUsersFromApi() {
-    try {
-        const { data } = await apiClient.get('/users');
-        return Array.isArray(data) ? data : [];
-    } catch (err) {
-        const status = err.response?.status;
-        // Issue #292: 500 often means Go ListUsers failed (e.g. NULL last_login scan).
-        // Returning [] makes mirrorDelete/Update silently no-op — log loudly.
-        console.warn(
-            `[userSync] readGoUsersFromApi failed: status=${status} ${err.message}` +
-            (status === 500
-                ? ' — Go user list broken; mirror create/update/delete will be skipped until fixed'
-                : '')
-        );
-        return [];
-    }
+    const listed = await listGoUsers();
+    return listed.users;
 }
 
 async function findGoUserByUsername(username) {
@@ -246,6 +308,7 @@ async function resolveGoUserId(localUserId) {
         return null;
     }
     if (!localUser) return null;
+    if (usesSharedUserStore()) return localUser.id;
 
     const goUser = await findGoUserByUsername(localUser.username);
     return goUser?.id || localUser.id;
@@ -260,7 +323,7 @@ async function resolveGoUserId(localUserId) {
  */
 async function mirrorCreate(username, password, role) {
     if (!username || !password) return;
-    if (db.type === 'postgres') {
+    if (usesSharedUserStore()) {
         return;
     }
     try {
@@ -295,6 +358,7 @@ async function mirrorCreate(username, password, role) {
 async function mirrorUpdate(username, { password, role, allowCreate = true } = {}) {
     if (!username) return;
     if (!password && !role) return;
+    if (usesSharedUserStore()) return;
 
     let goUser = await findGoUserByUsername(username);
 
@@ -333,38 +397,46 @@ async function mirrorUpdate(username, { password, role, allowCreate = true } = {
 
 /**
  * Mirror a delete to the Go side. Looks up the user by username first.
+ *
+ * Issue #315: returns a result object so the panel can fail closed (no local
+ * delete / rollback) when Go refuses last-admin (409). Shared PostgreSQL skips
+ * the HTTP mirror — local delete already removes the shared row.
+ *
+ * @returns {Promise<{ ok: boolean, skipped?: boolean|string, status?: number, conflict?: boolean }>}
  */
 async function mirrorDelete(username) {
-    if (!username) return;
+    if (!username) return { ok: true, skipped: true };
+    if (usesSharedUserStore()) return { ok: true, skipped: 'shared-db' };
+
     const goUser = await findGoUserByUsername(username);
-    if (!goUser) return;
+    if (!goUser) return { ok: true, skipped: 'not-on-go' };
     try {
         const safeId = assertSafeApiId(goUser.id, 'userId');
         await apiClient.delete(`/users/${encodeURIComponent(safeId)}`);
         console.log(`[userSync] Mirrored delete -> Go: '${username}'`);
+        return { ok: true };
     } catch (err) {
         const status = err.response?.status;
-        // 409 = "Cannot delete the last admin user" — keep the panel record
-        // anyway so the operator can react. Already logged here.
+        // 409 = "Cannot delete the last admin user" — caller must not leave
+        // panel/Go desynced (false success + backfill restore).
         console.warn(`[userSync] mirrorDelete('${username}') failed: status=${status} ${err.message}`);
+        return {
+            ok: false,
+            status: status || 502,
+            conflict: status === 409,
+        };
     }
 }
 
 async function mirrorTotpEnable(username, { secret } = {}) {
     if (!username || !secret) return;
-    if (db.type === 'postgres') {
-        // PostgreSQL uses the shared users table; the local enable already
-        // updates the row read by the Go API.
-        return;
-    }
+    if (usesSharedUserStore()) return;
     mirrorTotpToGoSqlite(username, { enabled: true, secret });
 }
 
 async function mirrorTotpDisable(username) {
     if (!username) return;
-    if (db.type === 'postgres') {
-        return;
-    }
+    if (usesSharedUserStore()) return;
     mirrorTotpToGoSqlite(username, { enabled: false });
 }
 
@@ -377,6 +449,7 @@ async function mirrorTotpDisable(username) {
  * PostgreSQL shared-DB installs normally already share the users table.
  */
 async function backfillFromNode() {
+    if (usesSharedSQLiteStore()) return { skipped: 'shared-store' };
     let nodeUsers;
     try {
         nodeUsers = await db.getAllUsers();
@@ -482,16 +555,26 @@ async function backfillFromGoPostgres() {
 }
 
 /**
- * Backfill: recover Node auth.db users from the Go server SQLite database.
+ * Backfill only legacy dual-store SQLite deployments.
  *
- * SQLite dual-DB installs read db_v2.sqlite3 directly (preserves password hashes).
- * PostgreSQL uses the Go REST API to reconcile auth_provider/role only.
+ * Consolidated SQLite and PostgreSQL already share one users table and must
+ * not run best-effort reconciliation over that source of truth.
  */
 async function backfillFromGo() {
     if (db.type === 'postgres') {
         return backfillFromGoPostgres();
     }
     if (typeof db.getAuthDb !== 'function') return { imported: 0, skipped: 'no-auth-db' };
+    let authDb;
+    try {
+        authDb = db.getAuthDb();
+        if (authDb === db.getDb()) {
+            return { imported: 0, skipped: 'shared-sqlite-store' };
+        }
+    } catch (err) {
+        console.warn(`[userSync] Go->Node backfill: cannot open local auth DB: ${err.message}`);
+        return { imported: 0, error: err.message };
+    }
 
     const goUsers = readGoUsersFromSqlite()
         .filter(u => normalizeUsername(u.username) && String(u.password_hash || '').trim() !== '');
@@ -508,14 +591,6 @@ async function backfillFromGo() {
     const localByUsername = new Set((localUsers || []).map(u => normalizeUsername(u.username)));
     const localIds = new Set((localUsers || []).map(u => Number(u.id)).filter(Number.isInteger));
     const missing = goUsers.filter(u => !localByUsername.has(normalizeUsername(u.username)));
-
-    let authDb;
-    try {
-        authDb = db.getAuthDb();
-    } catch (err) {
-        console.warn(`[userSync] Go->Node backfill: cannot open local auth DB: ${err.message}`);
-        return { imported: 0, error: err.message };
-    }
 
     const insertWithId = authDb.prepare(`
         INSERT INTO users (id, username, password_hash, role, auth_provider, created_at, last_login, totp_secret, totp_enabled)
@@ -598,6 +673,9 @@ function syncExistingAuthFromGo(authDb, goUsers, localUsers) {
 module.exports = {
     findGoUserByUsername,
     resolveGoUserId,
+    isSuperAdminRole,
+    listGoUsers,
+    assertGoAllowsSuperAdminDelete,
     mirrorCreate,
     mirrorUpdate,
     mirrorDelete,

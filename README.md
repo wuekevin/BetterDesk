@@ -9,7 +9,7 @@
 ![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)
 ![Go](https://img.shields.io/badge/Go-1.21+-00ADD8.svg)
 ![Node.js](https://img.shields.io/badge/Node.js-18+-339933.svg)
-![Version](https://img.shields.io/badge/version-3.3.170-brightgreen.svg)
+![Version](https://img.shields.io/badge/version-3.5.55-brightgreen.svg)
 ![Security](https://img.shields.io/badge/Security-TLS%20%2B%20NaCl%20%2B%20TOTP%20%2B%20E2EE-green.svg)
 ![Database](https://img.shields.io/badge/DB-SQLite%20%2B%20PostgreSQL-blue.svg)
 ![CDAP](https://img.shields.io/badge/CDAP-v1.0-orange.svg)
@@ -17,6 +17,7 @@
 
 [![Sponsor on GitHub](https://img.shields.io/badge/GitHub-Sponsor-181717?logo=github&logoColor=white&style=flat)](https://github.com/sponsors/UNITRONIX)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20me%20a%20coffee-%23FFDD00?logo=buy-me-a-coffee&logoColor=black&style=flat)](https://buymeacoffee.com/unitronix)
+[![Discord](https://img.shields.io/badge/Discord-Join%20us-5865F2?logo=discord&logoColor=white&style=flat)](https://discord.gg/MPp9hyyG97)
 
 **A clean-room RustDesk-compatible server written in Go — single binary replacing hbbs + hbbr — with full protocol support, TLS everywhere, PostgreSQL backend, CDAP (Custom Device API Protocol) for IoT/SCADA/network devices, and a modern Node.js web management console.**
 
@@ -486,6 +487,7 @@ The web console (`web-nodejs/`) is an Express.js application providing a full-fe
 | **PostgreSQL** backend | Tier 2 | ✅ Supported | Enterprise deployments |
 | **Windows** x86_64 | Tier 3 | ⚠️ Experimental | Community-tested, limited support |
 | **Synology DSM** (Docker) | Tier 3 | ⚠️ Experimental | Community-tested |
+| **FreeBSD** x86_64 | Tier 3 | ⚠️ Experimental | Community build + example `rc.d` in `contrib/freebsd/` — no official installer or CI binaries |
 
 > **Tier 1** = Fully tested by maintainers, highest priority for bug fixes.
 > **Tier 2** = Supported and tested, fixes provided.
@@ -694,9 +696,12 @@ The web console **Dashboard → RustDesk Client Configuration** card provides ma
 #### 1. QR / deep link
 
 ```
-rustdesk://config/<standard-base64-encoded-json>
+rustdesk://config/<reversed-deploy-string>
 ```
 
+Same encoding as **Copy deploy string** / Export Server Config (reversed base64, no `=` padding) — not standard base64 (#368).
+
+**Android / iOS (RustDesk 1.4.9+):** stock builds disable `rustdesk://config/...` unless the built-in option `allow-deep-link-server-settings` is `Y`. Fallback: **Copy deploy string** → client **Settings → Network → Import Server Config**, or enter the four Dashboard fields manually.
 #### 2. CLI / Import (`rustdesk.exe --config`)
 
 Uses a **reversed** base64 string (no `=` padding) — the same format as **Settings → Network → Import Server Config** in the RustDesk client. **Do not** pass raw JSON.
@@ -1468,7 +1473,7 @@ The Go server sends a UDP broadcast magic packet (6× `0xFF` + 16× MAC address)
 
 | Component | Technology |
 |-----------|-----------|
-| **Runtime** | Node.js 18+ |
+| **Runtime** | Node.js 22+ |
 | **Framework** | Express.js |
 | **Templates** | EJS |
 | **Database** | better-sqlite3 |
@@ -1579,7 +1584,7 @@ CDAP Device (Agent/Bridge)  ──WebSocket──►  Go Server (:21122/cdap)
 | SDK | Language | Status |
 |-----|----------|--------|
 | [Python SDK](sdks/python/) | Python 3.9+ | ✅ Stable |
-| [Node.js SDK](sdks/nodejs/) | Node.js 18+ | ✅ Stable |
+| [Node.js SDK](sdks/nodejs/) | Node.js 22+ | ✅ Stable |
 
 | Bridge | Protocol | Status |
 |--------|----------|--------|
@@ -1793,9 +1798,10 @@ The `archive/` directory (excluded from distribution via `.gitignore`) contains 
 
 ## 📞 Support
 
+- **Discord**: [Join the BetterDesk community](https://discord.gg/MPp9hyyG97) — chat, support, and announcements
 - **Documentation**: [docs/](docs/)
-- **Issues**: [GitHub Issues](https://github.com/UNITRONIX/Rustdesk-FreeConsole/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/UNITRONIX/Rustdesk-FreeConsole/discussions)
+- **Issues**: [GitHub Issues](https://github.com/UNITRONIX/BetterDesk/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/UNITRONIX/BetterDesk/discussions)
 
 ---
 

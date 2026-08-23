@@ -24,6 +24,7 @@ import (
 	"github.com/unitronix/betterdesk-server/cdap"
 	"github.com/unitronix/betterdesk-server/config"
 	"github.com/unitronix/betterdesk-server/crypto"
+	"github.com/unitronix/betterdesk-server/crypto/peervault"
 	"github.com/unitronix/betterdesk-server/db"
 	eventsModule "github.com/unitronix/betterdesk-server/events"
 	"github.com/unitronix/betterdesk-server/meshcentral"
@@ -73,15 +74,16 @@ type Server struct {
 	// branding endpoints to deter device-ID enumeration and config probing.
 	enrollmentLimiter *ratelimit.IPLimiter
 	brandingLimiter   *ratelimit.IPLimiter
-	keyPair           *crypto.KeyPair    // Ed25519 keypair for signing
-	cdapGw            *cdap.Gateway      // CDAP gateway (nil if CDAP disabled)
+	keyPair           *crypto.KeyPair      // Ed25519 keypair for signing
+	cdapGw            *cdap.Gateway        // CDAP gateway (nil if CDAP disabled)
 	meshGw            *meshcentral.Gateway // MeshCentral compat (nil if disabled)
-	ldapProvider      ldapAuthProvider // LDAP auth provider (nil if not configured)
-	oidcProvider      *auth.OIDCProvider // OIDC/OAuth2 auth provider (nil if not configured)
+	ldapProvider      ldapAuthProvider     // LDAP auth provider (nil if not configured)
+	oidcProvider      *auth.OIDCProvider   // OIDC/OAuth2 auth provider (nil if not configured)
 	clientTFASessions *tfaSessionStore
 	panelStore        db.PanelSyncStore // device groups, folders, ACL (PostgreSQL or legacy auth.db)
 	timeSync          *timesync.Service
 	billing           *billing.Service
+	peerVault         *peervault.Vault // AES-GCM for org peer credentials (#367)
 	httpSrv           *http.Server
 	wg                sync.WaitGroup
 	version           string
@@ -204,6 +206,17 @@ func (s *Server) SetJWTManager(jm *auth.JWTManager) {
 	s.jwtManager = jm
 }
 
+// InitPeerCredentialVault configures AES-GCM sealing for org peer passwords (#367).
+// Prefer dedicated ORG_PEER_VAULT_KEY; callers typically fall back to the JWT secret.
+func (s *Server) InitPeerCredentialVault(secret string) error {
+	v, err := peervault.New(secret)
+	if err != nil {
+		return err
+	}
+	s.peerVault = v
+	return nil
+}
+
 // SetKeyPair sets the Ed25519 keypair for the server (used for signing IdPk).
 func (s *Server) SetKeyPair(kp *crypto.KeyPair) {
 	s.keyPair = kp
@@ -243,9 +256,10 @@ func (s *Server) InitOIDC() {
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 
-	// Health + info (public, no auth required)
+	// Health and public key are needed for client bootstrap. Detailed runtime
+	// stats use the same allowlist/auth policy as Prometheus metrics.
 	mux.HandleFunc("GET /api/health", s.handleHealth)
-	mux.HandleFunc("GET /api/server/stats", s.handleServerStats)
+	mux.HandleFunc("GET /api/server/stats", s.metricsGuard(s.handleServerStats))
 	mux.HandleFunc("GET /api/server/pubkey", s.handlePubKey)
 
 	// Peers (permission-based access control)
@@ -268,6 +282,7 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/peers/{id}/access-policy", s.requireRole(auth.RoleOperator, s.handleGetAccessPolicy))
 	mux.HandleFunc("PUT /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleSaveAccessPolicy))
 	mux.HandleFunc("DELETE /api/peers/{id}/access-policy", s.requireRole(auth.RoleAdmin, s.handleDeleteAccessPolicy))
+	mux.HandleFunc("POST /api/peers/{id}/session-grant", s.requireRole(auth.RoleOperator, s.handleIssueSupportSessionGrant))
 	mux.HandleFunc("GET /api/peers/{id}/policy", s.handleGetPeerPolicy)
 
 	// Blocklist management
@@ -309,6 +324,10 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("PUT /api/org/{id}/settings", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgSetting)))
 	mux.HandleFunc("GET /api/org/{id}/address-book", s.requireOrgMembership("id", s.handleGetOrgAddressBook))
 	mux.HandleFunc("PUT /api/org/{id}/address-book", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgAddressBook)))
+	mux.HandleFunc("GET /api/org/{id}/peer-credentials", s.requireOrgMembership("id", s.handleListOrgPeerCredentials))
+	mux.HandleFunc("PUT /api/org/{id}/peer-credentials/{peerId}", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleSetOrgPeerCredential)))
+	mux.HandleFunc("DELETE /api/org/{id}/peer-credentials/{peerId}", s.requirePermission(auth.PermOrgEdit, s.requireOrgMembership("id", s.handleClearOrgPeerCredential)))
+	mux.HandleFunc("GET /api/peers/{id}/connect-password", s.requirePermission(auth.PermDeviceView, s.handleGetPeerConnectPassword))
 	mux.HandleFunc("POST /api/org/login", s.handleOrgLogin) // public — no auth required
 
 	// User-Org Linking (Issue #106)
@@ -343,6 +362,9 @@ func (s *Server) Start(ctx context.Context) error {
 	// fall back to signal_port - 2 (21114).
 	mux.HandleFunc("POST /api/login", s.handleClientLogin)
 	mux.HandleFunc("GET /api/login-options", s.handleClientLoginOptions)
+	mux.HandleFunc("POST /api/oidc/auth", s.handleClientOIDCAuth)
+	mux.HandleFunc("GET /api/oidc/auth-query", s.handleClientOIDCAuthQuery)
+	mux.HandleFunc("GET /api/oidc/callback", s.handleOIDCCallback) // alias; same IdP Redirect URL family
 	mux.HandleFunc("POST /api/logout", s.handleClientLogout)
 	mux.HandleFunc("GET /api/currentUser", s.handleClientCurrentUser)
 	mux.HandleFunc("POST /api/currentUser", s.handleClientCurrentUser)
@@ -442,7 +464,6 @@ func (s *Server) Start(ctx context.Context) error {
 	mux.HandleFunc("GET /api/devices/register/status", s.rateLimitPublic(s.enrollmentLimiter, s.handleDeviceRegisterStatus))
 	mux.HandleFunc("POST /api/devices/self/access-policy", s.rateLimitPublic(s.enrollmentLimiter, s.handleDeviceSelfAccessPolicy))
 	mux.HandleFunc("POST /api/devices/self/help-request", s.rateLimitPublic(s.enrollmentLimiter, s.handleDeviceSelfHelpRequest))
-	mux.HandleFunc("GET /api/devices/self/totp", s.rateLimitPublic(s.enrollmentLimiter, s.handleDeviceSelfTOTP))
 	mux.HandleFunc("POST /api/devices/self/totp", s.rateLimitPublic(s.enrollmentLimiter, s.handleDeviceSelfTOTP))
 
 	// Help requests — operator panel (raised by agents via CDAP or REST self endpoint)
@@ -475,8 +496,10 @@ func (s *Server) Start(ctx context.Context) error {
 
 	// Enrollment — operator approval (admin/operator)
 	mux.HandleFunc("GET /api/enrollment/pending", s.requireRole(auth.RoleOperator, s.handleListPendingDevices))
+	mux.HandleFunc("GET /api/enrollment/history", s.requireRole(auth.RoleOperator, s.handleListEnrollmentHistory))
 	mux.HandleFunc("POST /api/enrollment/approve/{id}", s.requireRole(auth.RoleOperator, s.handleApproveDevice))
 	mux.HandleFunc("POST /api/enrollment/reject/{id}", s.requireRole(auth.RoleOperator, s.handleRejectDevice))
+	mux.HandleFunc("POST /api/enrollment/clear-rejection/{id}", s.requireRole(auth.RoleOperator, s.handleClearEnrollmentRejection))
 
 	// LDAP configuration (server.config permission)
 	mux.HandleFunc("GET /api/auth/ldap/config", s.requirePermission(auth.PermServerConfig, s.handleGetLDAPConfig))
@@ -784,10 +807,23 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 
 	// Data scoping: org-scoped users only see their org's devices
 	orgID := getOrgIDFromCtx(r)
+	username := getUsernameFromCtx(r)
+	role := getRoleFromCtx(r)
+	needsDeviceACL := username != "" && role != "" &&
+		!auth.IsSuperAdminRole(role) && role != auth.RoleGlobalAdmin && role != auth.RoleServerAdmin
+
 	var peers []*db.Peer
 	var total int
 	var err error
-	if paginated {
+	// When device-group ACL applies, load the full candidate set first so
+	// pagination cannot leak peers on later pages from an unscoped DB query.
+	if needsDeviceACL {
+		if orgID != "" {
+			peers, err = s.db.ListPeersForOrg(orgID, includeDeleted)
+		} else {
+			peers, err = s.db.ListPeers(includeDeleted)
+		}
+	} else if paginated {
 		if orgID != "" {
 			peers, total, err = s.db.ListPeersForOrgPaginated(orgID, includeDeleted, limit, offset)
 		} else {
@@ -801,6 +837,41 @@ func (s *Server) handleListPeers(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeInternalError(w, err, "ListPeers")
 		return
+	}
+
+	if needsDeviceACL {
+		peerByID := make(map[string]*db.Peer, len(peers))
+		for _, p := range peers {
+			if p != nil {
+				peerByID[p.ID] = p
+			}
+		}
+		user := s.rustDeskUserForGroups(r, username, role)
+		if visible := s.rustDeskVisiblePeerSet(user, role, peerByID); visible != nil {
+			filtered := make([]*db.Peer, 0, len(peers))
+			for _, p := range peers {
+				if p != nil && visible[p.ID] {
+					filtered = append(filtered, p)
+				}
+			}
+			peers = filtered
+		}
+		total = len(peers)
+		if paginated {
+			start := offset
+			if start < 0 {
+				start = 0
+			}
+			if start > len(peers) {
+				peers = nil
+			} else {
+				end := start + limit
+				if end > len(peers) {
+					end = len(peers)
+				}
+				peers = peers[start:end]
+			}
+		}
 	}
 
 	// Enrich with live online status and status tier from memory map.
@@ -1205,6 +1276,28 @@ func (s *Server) handleUnbanPeer(w http.ResponseWriter, r *http.Request) {
 	if !s.peerOrgScopeCheck(w, r, id) {
 		return
 	}
+
+	peerRow, _ := s.db.GetPeer(id)
+	enrollmentRejectBan := peerRow != nil && peerRow.BanReason == enrollmentRejectBanReason
+
+	// Enrollment Reject & Ban created an audit-only peer. Unban must remove it
+	// so managed mode re-queues for approval instead of treating the ID as enrolled (#351).
+	if enrollmentRejectBan {
+		s.clearEnrollmentRejectionState(id)
+		if err := s.removeEnrollmentRejectAuditPeer(id); err != nil {
+			writeInternalError(w, err, "removeEnrollmentRejectAuditPeer")
+			return
+		}
+		if s.auditLog != nil {
+			s.auditLog.Log(audit.ActionPeerUnbanned, s.remoteIP(r), id, map[string]string{
+				"peer_removed": "true",
+				"reason":       enrollmentRejectBanReason,
+			})
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": "unbanned", "id": id, "peer_removed": "true"})
+		return
+	}
+
 	if err := s.db.UnbanPeer(id); err != nil {
 		writeInternalError(w, err, "UnbanPeer")
 		return
@@ -1214,6 +1307,9 @@ func (s *Server) handleUnbanPeer(w http.ResponseWriter, r *http.Request) {
 	if entry != nil {
 		entry.Banned = false
 	}
+
+	// Also clear enrollment rejection lock so the device can re-queue (#351).
+	s.clearEnrollmentRejectionState(id)
 
 	if s.auditLog != nil {
 		s.auditLog.Log(audit.ActionPeerUnbanned, s.remoteIP(r), id, nil)

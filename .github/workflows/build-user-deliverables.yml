@@ -1,0 +1,173 @@
+name: Build BetterDesk Windows Server and Desktop Clients
+
+on:
+  push:
+    branches:
+      - build/betterdesk-3.5.55-all
+  pull_request:
+    branches:
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  SERVER_DIR: betterdesk-server
+  CLIENT_DIR: betterdesk-desktop
+
+jobs:
+  server-windows-x64:
+    name: Windows Server x64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.SERVER_DIR }}/go.mod
+          cache-dependency-path: ${{ env.SERVER_DIR }}/go.sum
+
+      - name: Install Protobuf Compiler
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler zip
+
+      - name: Build Windows server
+        working-directory: ${{ env.SERVER_DIR }}
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: '0'
+        run: |
+          set -euo pipefail
+          VERSION="$(cat VERSION)"
+          go build -trimpath -ldflags="-s -w -X main.Version=${VERSION}" -o betterdesk-server-windows-amd64.exe .
+          sha256sum betterdesk-server-windows-amd64.exe > SERVER_CHECKSUMS.sha256
+          mkdir -p dist
+          cp betterdesk-server-windows-amd64.exe SERVER_CHECKSUMS.sha256 DEPLOY.md dist/
+          cd dist
+          zip -9 "BetterDesk-Server-${VERSION}-windows-x64.zip" betterdesk-server-windows-amd64.exe SERVER_CHECKSUMS.sha256 DEPLOY.md
+
+      - name: Upload Windows server
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterDesk-Server-Windows-x64
+          path: |
+            ${{ env.SERVER_DIR }}/dist/BetterDesk-Server-*-windows-x64.zip
+            ${{ env.SERVER_DIR }}/dist/betterdesk-server-windows-amd64.exe
+            ${{ env.SERVER_DIR }}/dist/SERVER_CHECKSUMS.sha256
+            ${{ env.SERVER_DIR }}/dist/DEPLOY.md
+          if-no-files-found: error
+
+  client-windows-x64:
+    name: Windows Desktop Client x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+
+      - name: Install Protobuf Compiler
+        run: choco install protoc -y
+
+      - name: Install WiX Toolset 5
+        shell: pwsh
+        run: dotnet tool install --global wix --version 5.0.2
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build Windows client
+        working-directory: ${{ env.CLIENT_DIR }}
+        run: python build.py build --target windows-x64
+
+      - name: Verify Windows client
+        shell: pwsh
+        run: |
+          $dist = "${{ env.CLIENT_DIR }}/dist"
+          $required = @("*.exe", "*.msi", "*portable.zip", "DESKTOP_CHECKSUMS.sha256")
+          foreach ($pattern in $required) {
+            if (-not (Get-ChildItem -Path $dist -Filter $pattern -File)) {
+              throw "Missing Windows desktop artifact: $pattern"
+            }
+          }
+
+      - name: Upload Windows client
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterDesk-Desktop-Windows-x64
+          path: |
+            ${{ env.CLIENT_DIR }}/dist/BetterDesk-Desktop-*
+            ${{ env.CLIENT_DIR }}/dist/DESKTOP_CHECKSUMS.sha256
+          if-no-files-found: error
+
+  client-macos:
+    name: macOS Desktop Client (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+          cache: true
+
+      - name: Install Protobuf Compiler
+        run: |
+          if ! command -v protoc >/dev/null 2>&1; then
+            brew install protobuf
+          fi
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Build macOS client
+        working-directory: ${{ env.CLIENT_DIR }}
+        run: python3 build_macos.py
+
+      - name: Verify macOS client
+        run: |
+          set -euo pipefail
+          dist="${{ env.CLIENT_DIR }}/dist"
+          test -f "$dist/BetterDesk-Desktop-$(cat VERSION)-macos-${{ matrix.arch }}.zip"
+          test -f "$dist/BetterDesk-Desktop-$(cat VERSION)-macos-${{ matrix.arch }}.dmg"
+          test -f "$dist/DESKTOP_CHECKSUMS-macos-${{ matrix.arch }}.sha256"
+
+      - name: Upload macOS client
+        uses: actions/upload-artifact@v4
+        with:
+          name: BetterDesk-Desktop-macOS-${{ matrix.arch }}
+          path: |
+            ${{ env.CLIENT_DIR }}/dist/BetterDesk-Desktop-*-macos-${{ matrix.arch }}.zip
+            ${{ env.CLIENT_DIR }}/dist/BetterDesk-Desktop-*-macos-${{ matrix.arch }}.dmg
+            ${{ env.CLIENT_DIR }}/dist/DESKTOP_CHECKSUMS-macos-${{ matrix.arch }}.sha256
+          if-no-files-found: error

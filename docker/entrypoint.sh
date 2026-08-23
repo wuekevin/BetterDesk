@@ -3,9 +3,13 @@
 # Runs Go server + Node.js console via supervisord
 set -e
 
+# shellcheck source=/dev/null
+. /ensure-app-user.sh
+ensure_betterdesk_user
+
 echo "========================================"
 echo "  BetterDesk All-in-One Container"
-echo "  Version: ${BETTERDESK_IMAGE_VERSION:-3.3.170}"
+echo "  Version: ${BETTERDESK_IMAGE_VERSION:-3.5.55}"
 echo "========================================"
 echo ""
 echo "Components:"
@@ -41,20 +45,83 @@ fi
 # Ensure data directories exist and have correct permissions
 mkdir -p /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
 chown -R betterdesk:betterdesk /opt/rustdesk /app/data /var/log/betterdesk 2>/dev/null || true
+
+# Write a file as betterdesk. Fresh named volumes inherit image ownership
+# (UID 10001 by default, or PUID after remap); with compose cap_drop:ALL root
+# has no CAP_DAC_OVERRIDE and cannot create files there (Permission denied on
+# .api_key, issue #299).
+write_as_betterdesk() {
+    # usage: write_as_betterdesk <path> <content>
+    _wad_path="$1"
+    _wad_content="$2"
+    if command -v su-exec >/dev/null 2>&1; then
+        printf '%s\n' "$_wad_content" | su-exec betterdesk sh -c "umask 077; cat > \"$_wad_path\""
+    else
+        printf '%s\n' "$_wad_content" | su -s /bin/sh betterdesk -c "umask 077; cat > \"$_wad_path\""
+    fi
+}
+touch_as_betterdesk() {
+    if command -v su-exec >/dev/null 2>&1; then
+        su-exec betterdesk touch "$1"
+    else
+        su -s /bin/sh betterdesk -c "touch \"$1\""
+    fi
+}
+
+# Bootstrap API key (shared between Go server and Node.js console)
+API_KEY_FILE="/opt/rustdesk/.api_key"
+if [ -z "${API_KEY:-}" ] && [ ! -f "$API_KEY_FILE" ]; then
+    if command -v openssl >/dev/null 2>&1; then
+        API_KEY=$(openssl rand -hex 32)
+    else
+        API_KEY=$(cat /dev/urandom | head -c 32 | od -An -tx1 | tr -d ' \n')
+    fi
+    write_as_betterdesk "$API_KEY_FILE" "$API_KEY"
+    echo "Auto-generated API key → $API_KEY_FILE"
+elif [ -n "${API_KEY:-}" ] && [ ! -f "$API_KEY_FILE" ]; then
+    write_as_betterdesk "$API_KEY_FILE" "$API_KEY"
+    echo "API key from env → $API_KEY_FILE"
+fi
+
+# Default enrollment policy.
+# Fresh volumes default to "managed": stock RustDesk clients are queued for
+# operator approval instead of connecting silently. Pre-existing installs keep
+# their current behavior (Go default "open", or whatever was set via the panel
+# and persisted in the database). A volume that already contains a server key
+# or SQLite database is treated as pre-existing.
+if [ -z "${ENROLLMENT_MODE:-}" ]; then
+    ENROLLMENT_SENTINEL="/opt/rustdesk/.enrollment_initialized"
+    if [ ! -f "$ENROLLMENT_SENTINEL" ]; then
+        if [ -f /opt/rustdesk/db_v2.sqlite3 ] || [ -f /opt/rustdesk/id_ed25519 ]; then
+            echo "Enrollment:   preserving existing policy (pre-existing volume)"
+        else
+            export ENROLLMENT_MODE="managed"
+            echo "Enrollment:   managed (fresh install — new devices need approval)"
+        fi
+        touch_as_betterdesk "$ENROLLMENT_SENTINEL" 2>/dev/null || true
+    fi
+fi
+# Always export so supervisord's %(ENV_ENROLLMENT_MODE)s interpolation resolves.
+# An empty value is ignored by the Go server (keeps default/DB-restored mode).
+export ENROLLMENT_MODE="${ENROLLMENT_MODE:-}"
+
 # Verify write access — SQLite WAL mode requires writable directory (Issue #78)
-if ! su -s /bin/sh betterdesk -c 'touch /opt/rustdesk/.write_test' 2>/dev/null; then
+_app_uid="${PUID:-10001}"
+_app_gid="${PGID:-10001}"
+if ! touch_as_betterdesk /opt/rustdesk/.write_test 2>/dev/null; then
     echo ""
-    echo "ERROR: /opt/rustdesk is NOT writable by the betterdesk user (UID 10001)."
+    echo "ERROR: /opt/rustdesk is NOT writable by the betterdesk user (UID ${_app_uid})."
     echo "  SQLite WAL mode requires write access to the database directory."
-    echo "  If using bind mounts, run: chown -R 10001:10001 /path/to/your/data"
+    echo "  If using bind mounts, either set PUID/PGID to the host owner, or run:"
+    echo "    chown -R ${_app_uid}:${_app_gid} /path/to/your/data"
     echo "  Or use Docker named volumes instead of bind mounts."
     echo ""
 fi
 rm -f /opt/rustdesk/.write_test 2>/dev/null || true
 # Fix private key permissions (volume mounts may preserve wrong UID/mode)
 if [ -f /opt/rustdesk/id_ed25519 ]; then
-    chmod 600 /opt/rustdesk/id_ed25519
-    chown betterdesk:betterdesk /opt/rustdesk/id_ed25519
+    chmod 600 /opt/rustdesk/id_ed25519 2>/dev/null || true
+    chown betterdesk:betterdesk /opt/rustdesk/id_ed25519 2>/dev/null || true
 fi
 
 # BD-2026-007: Warn about weak default secrets
@@ -79,7 +146,29 @@ else
     export DB_URL="${DB_PATH:-/opt/rustdesk/db_v2.sqlite3}"
     export AUTH_DB_PATH="${AUTH_DB_PATH:-/app/data/auth.db}"
     echo "Database:     SQLite (${DB_URL})"
-    echo "Panel sync:   ${AUTH_DB_PATH}"
+    echo "Legacy panel store: ${AUTH_DB_PATH}"
+fi
+
+# SQLite identity-store consolidation is explicit and runs before either
+# service starts. It produces candidate/backup snapshots and aborts the
+# container start on conflict instead of ever creating or overwriting auth.db.
+if [ "${MIGRATE_SQLITE_AUTH_DB:-N}" = "Y" ] && [ "${DB_TYPE}" != "postgres" ] && [ "${DB_TYPE}" != "postgresql" ]; then
+    if [ ! -f "${AUTH_DB_PATH}" ]; then
+        echo "ERROR: MIGRATE_SQLITE_AUTH_DB=Y but legacy auth.db is missing: ${AUTH_DB_PATH}"
+        exit 1
+    fi
+    if [ "${MIGRATE_SQLITE_AUTH_DRY_RUN:-N}" = "Y" ]; then
+        echo "Validating legacy SQLite auth migration..."
+        /usr/local/bin/betterdesk-server -migrate-sqlite-auth -migrate-sqlite-auth-dry-run \
+            -db "${DB_URL}" -migrate-sqlite-auth-backup-dir /app/data/backups
+    else
+        echo "Consolidating legacy auth.db into ${DB_URL}..."
+        /usr/local/bin/betterdesk-server -migrate-sqlite-auth \
+            -db "${DB_URL}" -migrate-sqlite-auth-backup-dir /app/data/backups
+    fi
+    if [ "${MIGRATE_SQLITE_AUTH_DRY_RUN:-N}" != "Y" ]; then
+        export SQLITE_AUTH_DB_MODE=consolidated
+    fi
 fi
 
 # Wait for PostgreSQL if configured
@@ -146,48 +235,12 @@ else
 fi
 export RELAY_SERVERS="${RELAY_SERVERS:-}"
 
-# Ensure API key exists (shared between Go server and Node.js console)
-API_KEY_FILE="/opt/rustdesk/.api_key"
-if [ -z "${API_KEY:-}" ] && [ ! -f "$API_KEY_FILE" ]; then
-    # Auto-generate a 32-byte hex API key
-    if command -v openssl >/dev/null 2>&1; then
-        API_KEY=$(openssl rand -hex 32)
-    else
-        API_KEY=$(cat /dev/urandom | head -c 32 | od -An -tx1 | tr -d ' \n')
-    fi
-    echo "$API_KEY" > "$API_KEY_FILE"
-    chmod 600 "$API_KEY_FILE"
-    chown betterdesk:betterdesk "$API_KEY_FILE" 2>/dev/null || true
-    echo "Auto-generated API key → $API_KEY_FILE"
-elif [ -n "${API_KEY:-}" ] && [ ! -f "$API_KEY_FILE" ]; then
-    echo "$API_KEY" > "$API_KEY_FILE"
-    chmod 600 "$API_KEY_FILE"
-    chown betterdesk:betterdesk "$API_KEY_FILE" 2>/dev/null || true
-    echo "API key from env → $API_KEY_FILE"
-fi
-
-# Default enrollment policy.
-# Fresh volumes default to "managed": stock RustDesk clients are queued for
-# operator approval instead of connecting silently. Pre-existing installs keep
-# their current behavior (Go default "open", or whatever was set via the panel
-# and persisted in the database). A volume that already contains a server key
-# or SQLite database is treated as pre-existing.
-if [ -z "${ENROLLMENT_MODE:-}" ]; then
-    ENROLLMENT_SENTINEL="/opt/rustdesk/.enrollment_initialized"
-    if [ ! -f "$ENROLLMENT_SENTINEL" ]; then
-        if [ -f /opt/rustdesk/db_v2.sqlite3 ] || [ -f /opt/rustdesk/id_ed25519 ]; then
-            echo "Enrollment:   preserving existing policy (pre-existing volume)"
-        else
-            export ENROLLMENT_MODE="managed"
-            echo "Enrollment:   managed (fresh install — new devices need approval)"
-        fi
-        touch "$ENROLLMENT_SENTINEL" 2>/dev/null || true
-        chown betterdesk:betterdesk "$ENROLLMENT_SENTINEL" 2>/dev/null || true
-    fi
-fi
-# Always export so supervisord's %(ENV_ENROLLMENT_MODE)s interpolation resolves.
-# An empty value is ignored by the Go server (keeps default/DB-restored mode).
-export ENROLLMENT_MODE="${ENROLLMENT_MODE:-}"
+# Always export so supervisord's %(ENV_*)s interpolation resolves (#299).
+# Compose usually sets these; Portainer / bare docker run may omit them.
+export NTP_SERVERS="${NTP_SERVERS:-pool.ntp.org,time.google.com,time.cloudflare.com}"
+export BILLING_MAX_CLOCK_SKEW_MS="${BILLING_MAX_CLOCK_SKEW_MS:-2000}"
+export BILLING_REQUIRE_SYNCED_CLOCK="${BILLING_REQUIRE_SYNCED_CLOCK:-1}"
+export BILLING_TRUST_OS_NTP="${BILLING_TRUST_OS_NTP:-Y}"
 
 echo ""
 echo "Starting services via supervisord..."

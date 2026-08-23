@@ -3,6 +3,7 @@
 package config
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"os"
@@ -63,21 +64,29 @@ type Config struct {
 	AdminPort int // TCP admin interface port (0 = disabled)
 
 	// Security — Authentication
-	JWTSecret               string // Secret key for JWT signing (auto-generated if empty)
+	JWTSecret string // Secret key for JWT signing (auto-generated if empty)
+	// OrgPeerVaultKey encrypts recoverable org peer passwords at rest (#367).
+	// Falls back to JWT secret when empty (installers should set a dedicated key).
+	OrgPeerVaultKey         string
 	JWTExpiry               int    // JWT token expiry in hours (default 24)
 	ClientSessionExpiryDays int    // RustDesk client session TTL in days (default 7)
 	ClientSessionSliding    bool   // Extend client session on activity (default true)
 	ClientSessionMaxDays    int    // Max sliding session lifetime from login (default 30)
-	AdminPassword           string // Password for admin TCP interface (empty = no auth)
-	ForceHTTPS      bool   // Reject non-TLS API requests (except behind reverse proxy)
-	TrustProxy      bool   // Trust X-Forwarded-For / X-Real-IP headers from reverse proxy
+	AdminPassword           string // Password for admin TCP interface (required when AdminPort is enabled)
+	ForceHTTPS              bool   // Reject non-TLS API requests (except behind reverse proxy)
+	TrustProxy              bool   // Trust X-Forwarded-For / X-Real-IP headers from reverse proxy
 	// TrustedProxies is the CIDR allowlist of reverse proxies that may set
 	// X-Forwarded-For / X-Real-IP. Required when TrustProxy is true — empty
 	// means forwarded headers are ignored (security-first, issue #276).
 	TrustedProxies []*net.IPNet
-	RelayMaxConnsIP int // Max relay connections per IP (0 = unlimited)
-	InitAdminUser   string // Initial admin username (created on first start)
-	InitAdminPass   string // Initial admin password (auto-generated if empty)
+	// PanelSignalProxyCIDRs is the allowlist of source IPs for the Node panel
+	// WebSocket→TCP proxy (/ws/rendezvous → hbbs). Web Remote never registers
+	// as a RustDesk peer; PunchHole/RequestRelay from these CIDRs are treated
+	// as panel-authorized initiators (#302 regression fix). Default: loopback.
+	PanelSignalProxyCIDRs []*net.IPNet
+	RelayMaxConnsIP       int    // Max relay connections per IP (0 = unlimited)
+	InitAdminUser         string // Initial admin username (created on first start)
+	InitAdminPass         string // Initial admin password (auto-generated if empty)
 
 	// Signal rate limiting (registrations per IP per minute).
 	// Issue #122: large NAT deployments may need to raise or disable this
@@ -107,7 +116,7 @@ type Config struct {
 	P2PFallbackMs int
 
 	// WebSocket security (M3)
-	AllowedWSOrigins    string // Comma-separated allowed WebSocket origins (empty = allow all)
+	AllowedWSOrigins    string // Comma-separated allowed WebSocket origins (empty = same-host only)
 	APIAllowedWSOrigins string // Comma-separated allowed WebSocket origins for HTTP API events endpoint
 
 	// Metrics endpoint access control (audit fix H-03, 2026-04-10)
@@ -131,15 +140,17 @@ type Config struct {
 	EnrollmentMode string
 
 	// CDAP Gateway
-	CDAPPort      int  // WebSocket gateway port (default 21122)
-	CDAPEnabled   bool // Enable CDAP gateway (default false)
-	CDAPTLS       bool // Enable TLS on CDAP port
-	CDAPRateLimit int  // Max requests per minute per IP (default 30)
+	CDAPPort        int  // WebSocket gateway port (default 21122)
+	CDAPEnabled     bool // Enable CDAP gateway (default false)
+	CDAPTLS         bool // Enable TLS on CDAP port
+	CDAPTLSRequired bool // Reject plaintext connections on the CDAP port
+	CDAPRateLimit   int  // Max requests per minute per IP (default 30)
 
 	// MeshCentral compatibility layer
 	MeshCentralEnabled bool   // MESH_ENABLED
 	MeshCoreVersion    string // MESH_CORE_VERSION pin
 	MeshAgentCertFile  string // MESH_AGENT_CERT_FILE RSA-3072 agent-server key
+	MeshWebCertFile    string // MESH_WEB_CERT_FILE public TLS cert agents see (proxy LE); overrides TLS_CERT for webHash
 	MeshAssetsDir      string // optional override for meshcore assets
 	MeshRateLimit      int    // WS upgrade rate limit per IP per minute
 
@@ -152,31 +163,37 @@ type Config struct {
 	BillingRequireWorkReport  bool   // Require technician report before session close
 }
 
+// DefaultPanelSignalProxyCIDRs is the loopback allowlist for the panel→hbbs
+// TCP proxy used by Web Remote (all-in-one and same-host native installs).
+const DefaultPanelSignalProxyCIDRs = "127.0.0.0/8,::1/128"
+
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
+	panelCIDRs, _ := ParseTrustedProxies(DefaultPanelSignalProxyCIDRs)
 	return &Config{
-		SignalPort:           21116,
-		RelayPort:            21117,
-		APIPort:              DefaultAPIPort,
-		Mode:                 "all",
-		DBPath:               "./db_v2.sqlite3",
-		KeyFile:              "id_ed25519",
-		JWTExpiry:            24,
-		ClientSessionExpiryDays: 7,
-		ClientSessionSliding:    true,
-		ClientSessionMaxDays:    30,
-		RelayMaxConnsIP:      20,
-		EnrollmentMode:       EnrollmentModeOpen, // Backward compatible default
-		CDAPPort:             21122,
-		CDAPEnabled:          true, // Enabled by default; set CDAP_ENABLED=N for minimal installs
-		CDAPRateLimit:        30,
-		MeshCentralEnabled:   true, // default on; set MESH_ENABLED=N to disable
-		MeshCoreVersion:      "1.2.0",
-		MeshAgentCertFile:    "mesh_agent_server.pem",
-		MeshRateLimit:        30,
-		SignalRateLimitPerIP: IPRateLimitRegistrations,
-		SameNATRelay:         true, // issue #121: auto-fallback to relay on shared public IP
-		P2PFirst:             true, // issue #157: give direct P2P a real chance before relay
+		SignalPort:                21116,
+		RelayPort:                 21117,
+		APIPort:                   DefaultAPIPort,
+		Mode:                      "all",
+		DBPath:                    "./db_v2.sqlite3",
+		KeyFile:                   "id_ed25519",
+		JWTExpiry:                 24,
+		ClientSessionExpiryDays:   7,
+		ClientSessionSliding:      true,
+		ClientSessionMaxDays:      30,
+		RelayMaxConnsIP:           20,
+		EnrollmentMode:            EnrollmentModeOpen, // Backward compatible default
+		PanelSignalProxyCIDRs:     panelCIDRs,
+		CDAPPort:                  21122,
+		CDAPEnabled:               true, // Enabled by default; set CDAP_ENABLED=N for minimal installs
+		CDAPRateLimit:             30,
+		MeshCentralEnabled:        true, // default on; set MESH_ENABLED=N to disable
+		MeshCoreVersion:           "1.2.0",
+		MeshAgentCertFile:         "mesh_agent_server.pem",
+		MeshRateLimit:             30,
+		SignalRateLimitPerIP:      IPRateLimitRegistrations,
+		SameNATRelay:              true, // issue #121: auto-fallback to relay on shared public IP
+		P2PFirst:                  true, // issue #157: give direct P2P a real chance before relay
 		P2PFallbackMs:             2000, // grace period for target hole punch before relay fallback
 		LogLevel:                  "info",
 		BillingMaxClockSkewMS:     2000,
@@ -275,6 +292,9 @@ func (c *Config) LoadEnv() {
 	if v := os.Getenv("JWT_SECRET"); v != "" {
 		c.JWTSecret = v
 	}
+	if v := os.Getenv("ORG_PEER_VAULT_KEY"); v != "" {
+		c.OrgPeerVaultKey = v
+	}
 	if v := os.Getenv("JWT_EXPIRY_HOURS"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
 			c.JWTExpiry = n
@@ -313,6 +333,17 @@ func (c *Config) LoadEnv() {
 			log.Printf("[config] TRUSTED_PROXIES parse error: %v — forwarded headers will not be honored", err)
 		} else {
 			c.TrustedProxies = nets
+		}
+	}
+	// Panel Web Remote proxy CIDRs (#302 regression). Unset keeps DefaultConfig
+	// loopback allowlist; set to override (e.g. Docker bridge when panel and Go
+	// run in separate containers).
+	if v := os.Getenv("PANEL_SIGNAL_PROXY_CIDRS"); v != "" {
+		nets, err := ParseTrustedProxies(v)
+		if err != nil {
+			log.Printf("[config] PANEL_SIGNAL_PROXY_CIDRS parse error: %v — keeping previous allowlist", err)
+		} else {
+			c.PanelSignalProxyCIDRs = nets
 		}
 	}
 	if v := os.Getenv("RELAY_MAX_CONNS_PER_IP"); v != "" {
@@ -403,6 +434,10 @@ func (c *Config) LoadEnv() {
 	if strings.ToUpper(os.Getenv("CDAP_TLS")) == "Y" {
 		c.CDAPTLS = true
 	}
+	if v := strings.ToUpper(os.Getenv("CDAP_TLS_REQUIRED")); v == "Y" || v == "YES" || v == "TRUE" || v == "1" {
+		c.CDAPTLSRequired = true
+		c.CDAPTLS = true
+	}
 	if v := os.Getenv("CDAP_RATE_LIMIT"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			c.CDAPRateLimit = n
@@ -418,6 +453,9 @@ func (c *Config) LoadEnv() {
 	}
 	if v := os.Getenv("MESH_AGENT_CERT_FILE"); v != "" {
 		c.MeshAgentCertFile = v
+	}
+	if v := os.Getenv("MESH_WEB_CERT_FILE"); v != "" {
+		c.MeshWebCertFile = v
 	}
 	if v := os.Getenv("MESH_ASSETS_DIR"); v != "" {
 		c.MeshAssetsDir = v
@@ -464,6 +502,16 @@ func (c *Config) LoadEnv() {
 			c.BillingRequireWorkReport = false
 		}
 	}
+}
+
+// ValidateAdminInterface rejects an enabled admin TCP listener without a
+// password. The listener provides privileged server management commands, so
+// binding it without authentication is not permitted.
+func (c *Config) ValidateAdminInterface() error {
+	if c != nil && c.AdminPort != 0 && strings.TrimSpace(c.AdminPassword) == "" {
+		return fmt.Errorf("ADMIN_PASSWORD is required when ADMIN_PORT is enabled")
+	}
+	return nil
 }
 
 // GetNTPServers returns configured NTP server hostnames.
@@ -531,7 +579,7 @@ func (c *Config) GetRelayServers() []string {
 }
 
 // GetAllowedWSOrigins parses the comma-separated list of allowed WebSocket origins.
-// Returns nil if empty (meaning all origins are allowed for backward compatibility).
+// Returns nil when unset so websocket.Accept uses its safe same-host default.
 // Supports glob patterns accepted by nhooyr.io/websocket:
 //   - "*" matches any origin
 //   - "*.example.com" matches subdomains
@@ -614,5 +662,12 @@ func (c *Config) APITLSEnabled() bool {
 
 // CDAPTLSEnabled returns true if TLS should be used for the CDAP WebSocket gateway.
 func (c *Config) CDAPTLSEnabled() bool {
-	return c.CDAPTLS && c.HasTLSCert()
+	return (c.CDAPTLS || c.CDAPTLSRequired) && c.HasTLSCert()
+}
+
+// CDAPTLSRequiredEnabled returns true when the CDAP gateway must reject
+// plaintext connections instead of accepting the backwards-compatible
+// dual-mode protocol.
+func (c *Config) CDAPTLSRequiredEnabled() bool {
+	return c.CDAPTLSRequired && c.HasTLSCert()
 }

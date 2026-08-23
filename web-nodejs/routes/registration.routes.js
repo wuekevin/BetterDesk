@@ -24,7 +24,6 @@
 const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
-const fs = require('fs');
 const db = require('../services/database');
 const config = require('../config/config');
 const { requirePermission } = require('../middleware/auth');
@@ -57,13 +56,12 @@ function getClientIp(req) {
 }
 
 /**
- * Read the server public key from disk (base64).
+ * Read the server public key (validated file, then live Go key).
  */
-function getServerPublicKey() {
+async function getServerPublicKey() {
     try {
-        if (fs.existsSync(config.pubKeyPath)) {
-            return fs.readFileSync(config.pubKeyPath, 'utf8').trim();
-        }
+        const keyService = require('../services/keyService');
+        return (await keyService.resolvePublicKey()) || '';
     } catch (_) { /* ignore */ }
     return '';
 }
@@ -78,14 +76,14 @@ function generateDeviceAccessToken() {
 /**
  * Build the server config payload returned to devices upon approval.
  */
-function buildServerConfig() {
+async function buildServerConfig() {
     const protocol = config.httpsEnabled ? 'https' : 'http';
     const consoleUrl = `${protocol}://0.0.0.0:${config.port}`;
 
     return {
         console_url: consoleUrl,
         server_address: `0.0.0.0:21116`,
-        server_key: getServerPublicKey(),
+        server_key: await getServerPublicKey(),
         access_token: generateDeviceAccessToken(),
     };
 }
@@ -216,11 +214,26 @@ router.get('/api/registrations', requirePermission('enrollment.approve'), async 
 
 /**
  * GET /api/registrations/count — Pending registration count (sidebar badge).
+ * Combines LAN discovery pending_registrations with Go managed enrollment queue (#351).
  */
 router.get('/api/registrations/count', requirePermission('enrollment.approve'), async (req, res) => {
     try {
-        const count = await db.getPendingRegistrationCount();
-        res.json({ success: true, count });
+        let lanCount = 0;
+        try {
+            lanCount = await db.getPendingRegistrationCount() || 0;
+        } catch (_) {
+            lanCount = 0;
+        }
+
+        let enrollmentCount = 0;
+        try {
+            const pending = await betterdeskApi.getEnrollmentPending();
+            enrollmentCount = (pending && pending.count) || 0;
+        } catch (_) {
+            enrollmentCount = 0;
+        }
+
+        res.json({ success: true, count: lanCount + enrollmentCount });
     } catch (err) {
         res.json({ success: true, count: 0 });
     }
@@ -283,7 +296,7 @@ router.put('/api/registrations/:id/approve', requirePermission('enrollment.appro
         }
 
         // Build server config — use actual server address from the request
-        const serverConfig = buildServerConfig();
+        const serverConfig = await buildServerConfig();
 
         // Replace 0.0.0.0 with the actual hostname / IP the admin is accessing
         const actualHost = req.headers.host?.split(':')[0] || req.hostname || 'localhost';
@@ -416,6 +429,21 @@ router.get('/api/enrollment/pending', requirePermission('enrollment.approve'), a
 });
 
 /**
+ * GET /api/enrollment/history — Approved/rejected Go enrollment history (#351).
+ * Query: status=approved|rejected (optional)
+ */
+router.get('/api/enrollment/history', requirePermission('enrollment.approve'), async (req, res) => {
+    try {
+        const status = typeof req.query.status === 'string' ? req.query.status : '';
+        const result = await betterdeskApi.getEnrollmentHistory(status);
+        res.json(result);
+    } catch (err) {
+        console.error('Get enrollment history error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
  * Apply manual device group memberships after enrollment approval.
  */
 async function applyDeviceGroupMemberships(req, deviceId, groupGuids) {
@@ -516,6 +544,32 @@ router.post('/api/enrollment/reject/:id', requirePermission('enrollment.approve'
         res.json(result);
     } catch (err) {
         console.error('Reject enrollment error:', err);
+        res.status(500).json({ success: false, error: req.t('errors.server_error') });
+    }
+});
+
+/**
+ * POST /api/enrollment/clear-rejection/:id — Clear rejection lock / allow re-enroll (#351).
+ */
+router.post('/api/enrollment/clear-rejection/:id', requirePermission('enrollment.approve'), async (req, res) => {
+    try {
+        const deviceId = req.params.id;
+        const result = await betterdeskApi.clearEnrollmentRejection(deviceId);
+
+        if (result.success) {
+            try {
+                await db.logAction(
+                    req.session?.user?.id || 0,
+                    'enrollment_rejection_cleared',
+                    `Cleared enrollment rejection for device ${deviceId}${result.data?.unbanned ? ' (unbanned)' : ''}`,
+                    getClientIp(req)
+                );
+            } catch (_) { /* audit log optional */ }
+        }
+
+        res.json(result);
+    } catch (err) {
+        console.error('Clear enrollment rejection error:', err);
         res.status(500).json({ success: false, error: req.t('errors.server_error') });
     }
 });

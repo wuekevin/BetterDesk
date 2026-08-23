@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v3.3.170
+#   BetterDesk Console Manager v3.5.55
 #   All-in-One Interactive Tool for Docker
 #
 #   Features:
@@ -28,7 +28,7 @@
 set -e
 
 # Version
-VERSION="3.3.170"
+VERSION="3.5.55"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Default paths (can be overridden by environment variables)
@@ -1210,8 +1210,28 @@ start_containers() {
     elif [ "$SERVER_RUNNING" = true ] && [ "$CONSOLE_RUNNING" = true ]; then
         print_success "All containers running"
     else
-        print_warning "Some containers might not be working properly"
+        print_error "Required BetterDesk containers are not running"
+        return 1
     fi
+
+    local api_port="21114"
+    if [ "$DOCKER_LAYOUT" = "single" ] || [ "$AIO_RUNNING" = true ]; then
+        api_port="21121"
+    fi
+    local health_deadline=60
+    while [ "$health_deadline" -gt 0 ]; do
+        if curl -fsS --max-time 3 "http://127.0.0.1:${api_port}/api/health" >/dev/null 2>&1 \
+            && curl -fsS --max-time 3 "http://127.0.0.1:5000/health" >/dev/null 2>&1; then
+            print_success "API and web console health checks passed"
+            return 0
+        fi
+        sleep 2
+        health_deadline=$((health_deadline - 2))
+    done
+
+    print_error "BetterDesk containers started but health checks failed"
+    print_info "Inspect logs with: $COMPOSE_CMD -f $COMPOSE_FILE logs --tail=100"
+    return 1
 }
 
 stop_containers() {
@@ -1222,6 +1242,15 @@ stop_containers() {
     $COMPOSE_CMD down 2>/dev/null || true
     
     print_success "Containers stopped"
+}
+
+# Resolve the container that runs the Node.js panel (single AIO vs split console).
+resolve_panel_container() {
+    if [ "$DOCKER_LAYOUT" = "single" ] || docker ps --format '{{.Names}}' 2>/dev/null | grep -q "^${AIO_CONTAINER}$"; then
+        echo "$AIO_CONTAINER"
+        return 0
+    fi
+    echo "$CONSOLE_CONTAINER"
 }
 
 create_admin_user() {
@@ -1240,27 +1269,15 @@ create_admin_user() {
     # Node.js console auto-creates admin user on startup if no users exist
     # We use the reset-password script to set a secure password
     # Arguments: <password> [username] — password first, then optional username
-    local target_container="$CONSOLE_CONTAINER"
-    if [ "$DOCKER_LAYOUT" = "single" ] || docker ps --format '{{.Names}}' | grep -q "^${AIO_CONTAINER}$"; then
-        target_container="$AIO_CONTAINER"
-    fi
+    local target_container
+    target_container=$(resolve_panel_container)
 
-    docker exec "$target_container" node /app/scripts/reset-password.js "$admin_password" admin 2>/dev/null || {
-        # If script fails, try via environment variable approach
-        print_info "Setting admin password via API..."
-        
-        # The console will create admin:admin by default on first run
-        # We need to change it to a secure random password
-        sleep 2
-        
-        # Use curl to change password (requires internal API)
-        # If this fails, admin will use default password which must be changed
-        docker exec "$target_container" sh -c "
-            if [ -f /app/scripts/reset-password.js ]; then
-                node /app/scripts/reset-password.js '$admin_password' admin 2>/dev/null
-            fi
-        " 2>/dev/null || true
-    }
+    if ! docker exec -u betterdesk "$target_container" \
+        node /app/scripts/reset-password.js "$admin_password" admin 2>/dev/null; then
+        print_error "Could not set the admin password safely"
+        print_info "The installation is incomplete; inspect container logs before retrying"
+        return 1
+    fi
 
     echo ""
     echo -e "${GREEN}╔════════════════════════════════════════════════════════╗${NC}"
@@ -1413,6 +1430,33 @@ docker_update_env_file() {
     else
         echo "$SCRIPT_DIR/web-nodejs/.env"
     fi
+}
+
+# Resolve container app UID/GID (PUID/PGID). Prefer process env, then compose .env, else 10001.
+resolve_docker_puid_pgid() {
+    local env_file val
+    DOCKER_PUID="${PUID:-}"
+    DOCKER_PGID="${PGID:-}"
+    env_file=$(docker_update_env_file)
+    if [ -z "$DOCKER_PUID" ] && [ -f "$SCRIPT_DIR/.env" ]; then
+        val=$(grep -E '^PUID=' "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r"')
+        [ -n "$val" ] && DOCKER_PUID="$val"
+    fi
+    if [ -z "$DOCKER_PGID" ] && [ -f "$SCRIPT_DIR/.env" ]; then
+        val=$(grep -E '^PGID=' "$SCRIPT_DIR/.env" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r"')
+        [ -n "$val" ] && DOCKER_PGID="$val"
+    fi
+    if [ -z "$DOCKER_PUID" ] && [ -f "$env_file" ]; then
+        val=$(grep -E '^PUID=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r"')
+        [ -n "$val" ] && DOCKER_PUID="$val"
+    fi
+    if [ -z "$DOCKER_PGID" ] && [ -f "$env_file" ]; then
+        val=$(grep -E '^PGID=' "$env_file" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '\r"')
+        [ -n "$val" ] && DOCKER_PGID="$val"
+    fi
+    DOCKER_PUID="${DOCKER_PUID:-10001}"
+    DOCKER_PGID="${DOCKER_PGID:-10001}"
+    export DOCKER_PUID DOCKER_PGID
 }
 
 read_update_github_branch_from_env() {
@@ -1776,14 +1820,15 @@ repair_named_volume_permissions() {
         return 0
     fi
 
-    print_info "Repairing Docker volume permissions: $volume"
-    docker run --rm -v "$volume:/target" alpine:3.20 sh -c '
+    resolve_docker_puid_pgid
+    print_info "Repairing Docker volume permissions: $volume (uid=${DOCKER_PUID} gid=${DOCKER_PGID})"
+    docker run --rm -v "$volume:/target" -e "PUID=${DOCKER_PUID}" -e "PGID=${DOCKER_PGID}" alpine:3.22 sh -c '
         set -e
         mkdir -p /target
-        chown -R 10001:10001 /target
+        chown -R "${PUID}:${PGID}" /target
         chmod -R u+rwX,g+rwX /target
     ' >/dev/null 2>&1 || {
-        print_warning "Could not repair volume $volume (Docker may need to pull alpine:3.20)"
+        print_warning "Could not repair volume $volume (Docker may need to pull alpine:3.22)"
         return 1
     }
 }
@@ -1792,6 +1837,7 @@ repair_docker_permissions() {
     print_step "Repairing Docker data permissions..."
 
     auto_detect_docker_paths
+    resolve_docker_puid_pgid
 
     if [ -n "$DATA_DIR" ]; then
         create_data_directory "$DATA_DIR" || {
@@ -1799,9 +1845,9 @@ repair_docker_permissions() {
             return 1
         }
 
-        # Containers drop to uid/gid 10001. Keep secrets readable to the
+        # Containers drop to PUID/PGID (default 10001). Keep secrets readable to the
         # container user without making them world-readable.
-        chown -R 10001:10001 "$DATA_DIR" 2>/dev/null || true
+        chown -R "${DOCKER_PUID}:${DOCKER_PGID}" "$DATA_DIR" 2>/dev/null || true
         chmod 755 "$DATA_DIR" 2>/dev/null || true
         for secret in ".api_key" ".admin_credentials" "id_ed25519"; do
             if [ -f "$DATA_DIR/$secret" ]; then
@@ -1811,7 +1857,7 @@ repair_docker_permissions() {
         if [ -f "$DATA_DIR/id_ed25519.pub" ]; then
             chmod 644 "$DATA_DIR/id_ed25519.pub" 2>/dev/null || true
         fi
-        print_success "Host data directory permissions repaired: $DATA_DIR"
+        print_success "Host data directory permissions repaired: $DATA_DIR (uid=${DOCKER_PUID} gid=${DOCKER_PGID})"
     fi
 
     local repaired_volumes=0
@@ -2183,11 +2229,14 @@ do_reset_password() {
     esac
     
     # Update password using reset-password.js (supports both SQLite and PostgreSQL)
-    # Update password using reset-password.js (supports both SQLite and PostgreSQL)
     # Arguments: <password> [username] — password first, then optional username
-    docker exec "$CONSOLE_CONTAINER" node /app/scripts/reset-password.js "$new_password" admin 2>/dev/null || {
+    # Single-container layout uses "betterdesk", not "betterdesk-console" (#299).
+    local panel_container
+    panel_container=$(resolve_panel_container)
+    # Run as betterdesk: auth.db is mode 0600 / owned by PUID (default 10001); root lacks CAP_DAC_OVERRIDE (#299).
+    docker exec -u betterdesk "$panel_container" node /app/scripts/reset-password.js "$new_password" admin 2>/dev/null || {
         print_warning "reset-password.js failed, trying inline fallback..."
-        docker exec -e RESET_ADMIN_PASSWORD="$new_password" "$CONSOLE_CONTAINER" node -e "
+        docker exec -u betterdesk -e RESET_ADMIN_PASSWORD="$new_password" "$panel_container" node -e "
 const bcrypt = require('bcrypt');
 const Database = require('better-sqlite3');
 const path = require('path');
@@ -2611,7 +2660,13 @@ do_uninstall() {
     
     print_step "Stopping containers..."
     cd "$SCRIPT_DIR"
-    $COMPOSE_CMD down -v 2>/dev/null || true
+    if confirm "Remove Docker volumes (this deletes named-volume data)?"; then
+        $COMPOSE_CMD down -v 2>/dev/null || true
+        print_info "Docker volumes removed"
+    else
+        $COMPOSE_CMD down 2>/dev/null || true
+        print_info "Docker volumes preserved"
+    fi
     
     if confirm "Remove Docker images?"; then
         docker rmi betterdesk-server betterdesk-console 2>/dev/null || true

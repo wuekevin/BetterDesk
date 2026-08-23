@@ -60,6 +60,9 @@ services:
       - API_KEY_PATH=/opt/rustdesk/.api_key
       - SESSION_SECRET=${SESSION_SECRET:-}
       - DOCKER=true
+      # Optional: map betterdesk to host bind-mount owner (Synology etc.). Default 10001.
+      - PUID=${PUID:-10001}
+      - PGID=${PGID:-10001}
       # Database — defaults to SQLite; set via .env or command line for PostgreSQL
       - DB_TYPE=${DB_TYPE:-sqlite}
       - DATABASE_URL=${DATABASE_URL:-}
@@ -111,8 +114,10 @@ services:
     container_name: betterdesk-postgres
     environment:
       - POSTGRES_USER=betterdesk
-      # BD-2026-007: PG_PASSWORD MUST be set explicitly — do not use default values in production
-      - POSTGRES_PASSWORD=${PG_PASSWORD:?PG_PASSWORD must be set for PostgreSQL}
+      # Compose interpolates profile variables even when the profile is disabled.
+      # Keep SQLite/default validation usable without a secret; the postgres
+      # profile still requires PG_PASSWORD to be set before it is started.
+      - POSTGRES_PASSWORD=${PG_PASSWORD:-}
       - POSTGRES_DB=betterdesk
     volumes:
       - postgres-data:/var/lib/postgresql/data

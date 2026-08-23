@@ -135,6 +135,25 @@ const FILE_RULES = [
         },
     },
     {
+        id: 'install-sh',
+        path: 'install.sh',
+        extract: (content) => {
+            const m = content.match(/BETTERDESK_VERSION="\$\{BETTERDESK_VERSION:-([^}]+)\}"/);
+            return m?.[1];
+        },
+        apply: (content, version) => {
+            let next = content.replace(
+                /BETTERDESK_VERSION="\$\{BETTERDESK_VERSION:-[^}]+\}"/,
+                `BETTERDESK_VERSION="\${BETTERDESK_VERSION:-${version}}"`
+            );
+            next = next.replace(
+                /(Docker image tag \/ release baseline \(default: )[^)]+(\))/,
+                `$1${version}$2`
+            );
+            return next;
+        },
+    },
+    {
         id: 'docker-compose-quick',
         path: 'docker-compose.quick.yml',
         extract: (content) => {
@@ -151,8 +170,10 @@ const FILE_RULES = [
             const m = content.match(/\$\{BETTERDESK_IMAGE_TAG:-([^}]+)\}/);
             return m?.[1];
         },
-        apply: (content, version) =>
-            content.replace(/\$\{BETTERDESK_IMAGE_TAG:-[^}]+\}/g, `\${BETTERDESK_IMAGE_TAG:-${version}}`),
+        apply: (content, version) => content
+            .replace(/\$\{BETTERDESK_IMAGE_TAG:-[^}]+\}/g, `\${BETTERDESK_IMAGE_TAG:-${version}}`)
+            .replace(/(#\s+Default:\s+)[^ \t]+(\s+\|\s+Rolling:)/, `$1${version}$2`)
+            .replace(/(BETTERDESK_IMAGE_TAG=)[^ \s]+(\s+docker compose up -d)/, `$1${version}$2`),
     },
     {
         id: 'docker-compose-quick-single-macvlan',
@@ -211,6 +232,20 @@ const FILE_RULES = [
         path: 'betterdesk-server/internal/productversion/VERSION',
         extract: (content) => content.trim(),
         apply: (_content, version) => `${version}\n`,
+    },
+    {
+        id: 'desktop-cargo',
+        path: 'betterdesk-desktop/Cargo.toml',
+        extract: (content) => content.match(/^version\s*=\s*"([^"]+)"/m)?.[1],
+        apply: (content, version) =>
+            content.replace(/^(version\s*=\s*")[^"]+(")/m, `$1${version}$2`),
+    },
+    {
+        id: 'desktop-flutter-pubspec',
+        path: 'betterdesk-desktop/flutter/pubspec.yaml',
+        extract: (content) => content.match(/^version:\s*([^\s+]+)/m)?.[1],
+        apply: (content, version) =>
+            content.replace(/^(version:\s*)[^\s+]+(\+[^\s]+)?/m, `$1${version}$2`),
     },
 ];
 

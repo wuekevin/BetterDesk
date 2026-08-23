@@ -390,39 +390,6 @@
                 </div>
             </div>
             
-            <!-- Tutorials Section -->
-            <div class="settings-panel">
-                <div class="settings-panel-header">
-                    <h2 class="settings-panel-title">
-                        <span class="material-icons">school</span>
-                        ${_('settings.tutorials_title')}
-                    </h2>
-                    <p class="settings-panel-desc">${_('settings.tutorials_desc')}</p>
-                </div>
-                <div class="settings-panel-body">
-                    <div class="settings-row">
-                        <div class="settings-row-label">
-                            <label class="form-label" for="tutorials-enabled">${_('settings.tutorials_enabled')}</label>
-                            <p class="settings-row-hint">${_('settings.tutorials_enabled_hint')}</p>
-                        </div>
-                        <div class="settings-row-control">
-                            <input type="checkbox" id="tutorials-enabled" class="toggle-switch" aria-describedby="tutorials-enabled-hint">
-                        </div>
-                    </div>
-                    <div class="settings-row">
-                        <div class="settings-row-label">
-                            <span class="form-label">${_('tutorial.reset_all')}</span>
-                            <p class="settings-row-hint" id="tutorials-reset-hint">${_('settings.tutorials_reset_hint')}</p>
-                        </div>
-                        <div class="settings-row-control">
-                            <button type="button" class="btn btn-secondary btn-sm" id="tutorials-reset-btn">
-                                <span class="material-icons">refresh</span>
-                                ${_('tutorial.reset_all')}
-                            </button>
-                        </div>
-                    </div>
-                </div>
-            </div>
         </div>
         </div>
         
@@ -676,6 +643,33 @@
                     <p class="settings-panel-desc">${_('branding.colors_desc')}</p>
                 </div>
                 <div class="settings-panel-body">
+                    <div class="form-group" style="max-width: 520px; margin-bottom: 1.25rem;">
+                        <label class="form-label" for="theme-mode-select">${_('theme.title') || 'Theme'}</label>
+                        <p class="settings-row-hint">${_('ux35.theme_mode_hint') || 'Light and Dark are built-in. Custom activates when you edit colors below.'}</p>
+                        <div class="logo-type-selector" id="theme-mode-selector" role="radiogroup" aria-label="${_('theme.title') || 'Theme'}">
+                            <label class="logo-type-option">
+                                <input type="radio" name="theme-mode" value="dark" checked>
+                                <span class="logo-type-card">
+                                    <span class="material-icons">dark_mode</span>
+                                    <span>${_('theme.dark') || 'Dark'}</span>
+                                </span>
+                            </label>
+                            <label class="logo-type-option">
+                                <input type="radio" name="theme-mode" value="light">
+                                <span class="logo-type-card">
+                                    <span class="material-icons">light_mode</span>
+                                    <span>${_('theme.light') || 'Light'}</span>
+                                </span>
+                            </label>
+                            <label class="logo-type-option">
+                                <input type="radio" name="theme-mode" value="custom">
+                                <span class="logo-type-card">
+                                    <span class="material-icons">palette</span>
+                                    <span>${_('theme.custom') || 'Custom'}</span>
+                                </span>
+                            </label>
+                        </div>
+                    </div>
                     <div class="color-grid">
                         <div class="color-group">
                             <h3 class="color-group-title">${_('branding.colors_backgrounds')}</h3>
@@ -1832,8 +1826,9 @@
 
                             <div class="form-group">
                                 <label class="form-label" for="oidc-redirect-url">${_('settings.oidc_redirect_url')}</label>
-                                <input type="url" id="oidc-redirect-url" class="form-input" placeholder="http://your-server:21114/api/auth/oidc/callback">
+                                <input type="url" id="oidc-redirect-url" class="form-input" placeholder="https://your-server:5443/api/auth/oidc/callback">
                                 <small class="form-hint">${_('settings.oidc_redirect_url_hint')}</small>
+                                <div id="oidc-redirect-url-warning" class="alert alert-warning" style="display:none;margin-top:8px;" role="status"></div>
                             </div>
 
                             <div class="form-group">
@@ -2183,6 +2178,7 @@
                         <span class="text-muted">${_('updates.channel_branch_label')}:</span>
                         <span id="update-channel-branch">&mdash;</span>
                         <p class="win11-updates-option-hint">${_('updates.channel_apply_hint')}</p>
+                        <p id="update-channel-docker-hint" class="win11-updates-option-hint" style="display:none"></p>
                     </div>
                 </div>
 

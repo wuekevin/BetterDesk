@@ -11,6 +11,7 @@ on:
       - 'betterdesk.sh'
       - 'betterdesk.ps1'
       - 'betterdesk-docker.sh'
+      - 'install.sh'
       - 'CHANGELOG.md'
       - 'README.md'
       - 'Dockerfile*'
@@ -31,6 +32,7 @@ on:
       - 'betterdesk.sh'
       - 'betterdesk.ps1'
       - 'betterdesk-docker.sh'
+      - 'install.sh'
       - 'CHANGELOG.md'
       - 'README.md'
       - 'Dockerfile*'
@@ -52,6 +54,6 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '24'
       - name: Verify product version parity
         run: node scripts/bump-version.js --verify

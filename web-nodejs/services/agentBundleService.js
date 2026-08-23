@@ -107,7 +107,10 @@ function validateBranding(input = {}) {
     const out = {};
 
     out.company_name = clip(input.company_name || input.companyName, MAX_NAME);
-    if (!out.company_name) errors.push('company_name_required');
+    // Optional for quick Support Agent creation — defaults to product name.
+    if (!out.company_name) {
+        out.company_name = 'BetterDesk Support';
+    }
 
     out.short_text   = clip(input.short_text   || input.shortText,   MAX_SHORT_TEXT);
     out.contact_email = clip(input.contact_email || input.contactEmail, MAX_CONTACT);
@@ -147,20 +150,20 @@ function validateBranding(input = {}) {
     }
     out.primary_color = out.primary_color.toLowerCase();
 
-    out.accent_color = (input.accent_color || input.accentColor || '#1e293b');
+    out.accent_color = (input.accent_color || input.accentColor || '#e0f2fe');
     if (!HEX_COLOR.test(out.accent_color)) {
         errors.push('accent_color_invalid');
-        out.accent_color = '#1e293b';
+        out.accent_color = '#e0f2fe';
     }
     out.accent_color = out.accent_color.toLowerCase();
 
     const colorFields = [
-        ['background_color', '#0f172a', 'background_color'],
-        ['surface_color', '#1e293b', 'surface_color'],
-        ['text_color', '#e2e8f0', 'text_color'],
-        ['text_muted_color', '#94a3b8', 'text_muted_color'],
+        ['background_color', '#ffffff', 'background_color'],
+        ['surface_color', '#f3f4f6', 'surface_color'],
+        ['text_color', '#1f2937', 'text_color'],
+        ['text_muted_color', '#6b7280', 'text_muted_color'],
         ['status_ready_color', '#22c55e', 'status_ready_color'],
-        ['header_text_color', '#ffffff', 'header_text_color'],
+        ['header_text_color', '#1f2937', 'header_text_color'],
     ];
     for (const [key, fallback, errKey] of colorFields) {
         const alt = key.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
@@ -173,6 +176,18 @@ function validateBranding(input = {}) {
     }
 
     out.allow_unattended = !!(input.allow_unattended ?? input.allowUnattended ?? false);
+
+    // Incoming capability defaults (Support Agent). Omitted keys default to true.
+    const capsIn = input.capabilities && typeof input.capabilities === 'object' ? input.capabilities : {};
+    const cap = (v, d = true) => (v === undefined || v === null ? d : !!v);
+    out.capabilities = {
+        desktop:   cap(capsIn.desktop, true),
+        files:     cap(capsIn.files, true),
+        clipboard: cap(capsIn.clipboard, true),
+        audio:     cap(capsIn.audio, true),
+        terminal:  cap(capsIn.terminal, true),
+        restart:   cap(capsIn.restart, true),
+    };
 
     out.default_lang = String(input.default_lang || input.defaultLang || 'en');
     if (!SUPPORTED_LANGS.includes(out.default_lang)) {
@@ -191,7 +206,10 @@ function validateBranding(input = {}) {
     } else {
         errors.push('server_host_required');
     }
-    out.use_https = !!(input.use_https ?? input.useHttps ?? conn.defaultUseHttps());
+    // HTTPS/WSS is recommended for public internet; HTTP/WS is allowed for
+    // LAN/IP deployments (RustDesk-style). Session crypto stays on the
+    // signal/relay protocol layer; the signed profile still binds endpoints.
+    out.use_https = !!(input.use_https ?? input.useHttps ?? true);
 
     // Never accept enrollment_token from the browser — issued by backend only.
     if (input.server && typeof input.server === 'object') {
@@ -329,17 +347,25 @@ function defaultBranding() {
         contact_url: '',
         logo_data_url: '',
         primary_color: '#2563eb',
-        accent_color: '#1e293b',
-        background_color: '#0f172a',
-        surface_color: '#1e293b',
-        text_color: '#e2e8f0',
-        text_muted_color: '#94a3b8',
+        accent_color: '#e0f2fe',
+        background_color: '#ffffff',
+        surface_color: '#f3f4f6',
+        text_color: '#1f2937',
+        text_muted_color: '#6b7280',
         status_ready_color: '#22c55e',
-        header_text_color: '#ffffff',
+        header_text_color: '#1f2937',
         allow_unattended: false,
+        capabilities: {
+            desktop: true,
+            files: true,
+            clipboard: true,
+            audio: true,
+            terminal: true,
+            restart: true,
+        },
         default_lang: 'en',
         server_host: '',
-        use_https: conn.defaultUseHttps(),
+        use_https: true,
         server: { address: '', api_url: '', public_key: '' },
     };
 }

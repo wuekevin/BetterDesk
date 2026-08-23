@@ -86,14 +86,18 @@ func (s *tfaSessionStore) take(secret string) *tfaSession {
 }
 
 // rustdeskUserPayload builds a user object in the format the RustDesk client expects.
+// RustDesk 1.4.x requires `info` (UserInfo) with no serde default — omitting it makes
+// auth-query success JSON fail to deserialize, so the client stays on "Waiting account auth" (#326).
 func rustdeskUserPayload(username, role string) map[string]any {
 	return map[string]any{
-		"name":     username,
-		"email":    "",
-		"note":     "",
-		"status":   1, // kNormal
-		"grp":      "",
-		"is_admin": role == auth.RoleAdmin,
+		"name":         username,
+		"email":        "",
+		"note":         "",
+		"status":       1, // kNormal
+		"grp":          "",
+		"is_admin":     role == auth.RoleAdmin,
+		"display_name": username,
+		"info":         map[string]any{},
 	}
 }
 
@@ -299,8 +303,13 @@ func (s *Server) handleClientTFAVerify(w http.ResponseWriter, clientIP, totpCode
 
 // handleClientLoginOptions returns available authentication methods.
 // GET /api/login-options
+// Stock RustDesk expects [""] for password plus "oidc/<name>" entries when SSO is enabled.
 func (s *Server) handleClientLoginOptions(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, []string{""})
+	opts := []string{""}
+	if s.oidcProvider != nil && s.oidcProvider.IsEnabled() {
+		opts = append(opts, s.oidcProvider.ClientLoginOptionToken())
+	}
+	writeJSON(w, http.StatusOK, opts)
 }
 
 // handleClientLogout handles logout for RustDesk clients.
@@ -385,12 +394,15 @@ func (s *Server) handleClientAddressBook(w http.ResponseWriter, r *http.Request)
 			return
 		}
 		data = s.mergeOrgAddressBooksIntoAB(r, data)
+		data = s.injectOrgPeerCredentialsIntoAB(r, data)
 		if !auth.IsProRole(role) {
 			// Merge admin-set tags from peers table into AB (#76 TAG sync)
 			data = s.mergeAdminTagsIntoAB(data)
 			// RustDesk legacy AB reads tags from GET /api/ab (not /api/ab/tags).
 			data = s.syncServerTagsIntoAddressBook(data, r, username, role)
 		}
+		// Enforce device-group / folder ACL on Address Book peers (org merge + stale entries).
+		data = s.applyDeviceScopeToAddressBook(r, username, role, data)
 		writeJSON(w, http.StatusOK, map[string]any{"data": data, "licensed_devices": 0})
 
 	case http.MethodPost:
@@ -444,6 +456,7 @@ func (s *Server) handleClientAddressBookPersonal(w http.ResponseWriter, r *http.
 		if !auth.IsProRole(role) {
 			data = s.mergeAdminTagsIntoAB(data)
 		}
+		data = s.applyDeviceScopeToAddressBook(r, username, role, data)
 		writeJSON(w, http.StatusOK, map[string]any{"data": data})
 
 	case http.MethodPost:

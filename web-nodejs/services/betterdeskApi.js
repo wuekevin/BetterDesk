@@ -786,6 +786,21 @@ async function getEnrollmentPending() {
 }
 
 /**
+ * Get approved/rejected Go enrollment history (#351).
+ * @param {string} [status] - "approved" | "rejected" | omit for both
+ */
+async function getEnrollmentHistory(status) {
+    try {
+        const params = {};
+        if (status) params.status = status;
+        const { data } = await apiClient.get('/enrollment/history', { params });
+        return { success: true, data: data.devices || [], count: data.count || 0 };
+    } catch (e) {
+        return { success: false, error: e.message, data: [], count: 0 };
+    }
+}
+
+/**
  * Approve a pending enrollment request on Go server.
  * @param {string} deviceId - Device ID to approve
  * @param {string} displayName - Operator-assigned display name
@@ -815,6 +830,19 @@ async function rejectEnrollment(deviceId, ban) {
         const { data } = await apiClient.post(`/enrollment/reject/${encodeURIComponent(deviceId)}`, {
             ban: !!ban
         });
+        return wrap(data);
+    } catch (e) {
+        return { success: false, error: e.message };
+    }
+}
+
+/**
+ * Clear enrollment rejection lock so the device can re-request enrollment (#351).
+ * @param {string} deviceId
+ */
+async function clearEnrollmentRejection(deviceId) {
+    try {
+        const { data } = await apiClient.post(`/enrollment/clear-rejection/${encodeURIComponent(deviceId)}`);
         return wrap(data);
     } catch (e) {
         return { success: false, error: e.message };
@@ -882,6 +910,16 @@ async function deleteAccessPolicy(id) {
     } catch (e) {
         return { success: false, error: e.message };
     }
+}
+
+/**
+ * Fetch org vault connect password for Web Remote auto-fill (#367).
+ * Propagates HTTP errors so callers can distinguish 404/403.
+ */
+async function getPeerConnectPassword(id) {
+    const safeId = assertSafeApiId(id, 'peerId');
+    const { data } = await apiClient.get(`/peers/${encodeURIComponent(safeId)}/connect-password`);
+    return data;
 }
 
 // ── RBAC: Roles & Permissions (Phase 52) ─────────────────────
@@ -1119,6 +1157,75 @@ function isAbsoluteHttpUrl(value) {
 }
 
 /**
+ * Proxy IdP callback to Go (panel :5000/:5443 → Go API).
+ * GET /api/auth/oidc/callback and GET /api/oidc/callback (#304).
+ *
+ * Forwards status, Location (panel session redirect or errors), Content-Type,
+ * and body (HTML success page for RustDesk client OIDC). Does not follow
+ * redirects — the browser must see Go's 302 Location.
+ *
+ * @param {import('express').Request} req
+ * @param {import('express').Response} res
+ */
+async function proxyOIDCCallback(req, res) {
+    const qs = new URLSearchParams();
+    const query = req.query || {};
+    for (const key of Object.keys(query)) {
+        const val = query[key];
+        if (typeof val === 'string') {
+            qs.set(key, val);
+        } else if (Array.isArray(val) && typeof val[0] === 'string') {
+            qs.set(key, val[0]);
+        }
+    }
+    const suffix = qs.toString();
+    // Prefer canonical Go path; /api/oidc/callback is also registered on Go.
+    const path = `/auth/oidc/callback${suffix ? `?${suffix}` : ''}`;
+
+    try {
+        const response = await apiClient.get(path, {
+            maxRedirects: 0,
+            validateStatus: () => true,
+            responseType: 'arraybuffer',
+            timeout: Math.max(config.betterdeskApiTimeout || 15000, 30000),
+            headers: {
+                Accept: 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+            },
+            transformRequest: [(data, headers) => {
+                // GET must not advertise JSON content-type from the shared client.
+                if (headers) {
+                    delete headers['Content-Type'];
+                    delete headers['content-type'];
+                }
+                return data;
+            }],
+        });
+
+        const ct = response.headers['content-type'] || response.headers['Content-Type'];
+        if (ct) {
+            res.setHeader('Content-Type', ct);
+        }
+        const location = response.headers.location || response.headers.Location;
+        if (location) {
+            res.setHeader('Location', location);
+        }
+        const cacheControl = response.headers['cache-control'];
+        if (cacheControl) {
+            res.setHeader('Cache-Control', cacheControl);
+        }
+
+        const status = Number(response.status) || 502;
+        const body = response.data != null ? Buffer.from(response.data) : Buffer.alloc(0);
+        res.status(status).send(body);
+    } catch (err) {
+        console.error('[OIDC] callback proxy failed:', err.message);
+        if (!res.headersSent) {
+            res.status(502).type('text/plain').send('OIDC callback proxy failed');
+        }
+    }
+}
+
+/**
  * GET /api/auth/oidc/authorize — Server-to-server: capture Go's 302 Location (IdP URL).
  * The browser must never be redirected to BETTERDESK_API_URL (often localhost).
  */
@@ -1263,8 +1370,10 @@ module.exports = {
     setEnrollmentMode,
     // Enrollment — pending devices
     getEnrollmentPending,
+    getEnrollmentHistory,
     approveEnrollment,
     rejectEnrollment,
+    clearEnrollmentRejection,
     // Branding (Go server)
     getBranding: getBranding,
     saveBranding: saveBranding,
@@ -1272,6 +1381,7 @@ module.exports = {
     getAccessPolicy,
     saveAccessPolicy,
     deleteAccessPolicy,
+    getPeerConnectPassword,
     // RBAC: Roles & Permissions (Phase 52)
     listRoles,
     getRolePermissions,
@@ -1289,6 +1399,7 @@ module.exports = {
     getOIDCStatus,
     exchangeOIDCCode,
     startOIDCAuthorize,
+    proxyOIDCCallback,
     assignStrategy,
     getStrategy,
     setStrategyStatus,

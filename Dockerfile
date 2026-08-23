@@ -17,7 +17,7 @@
 #   5000  - Web Console (Node.js admin panel)
 
 # ============= Stage 1: Build Go server =============
-FROM golang:1.25-alpine AS go-builder
+FROM golang:1.26-alpine AS go-builder
 
 # Retry apk in case of transient DNS failures (common on AlmaLinux/CentOS Docker)
 RUN apk add --no-cache git || { sleep 2 && apk add --no-cache git; }
@@ -36,7 +36,10 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
     -o /betterdesk-server .
 
 # ============= Stage 2: Build Node.js console =============
-FROM node:20-alpine AS node-builder
+# TEMPORARY: Node 24.19.0 triggers a native better-sqlite3 cleanup-hook
+# assertion during Statement GC. Keep the production console on the latest
+# Node 22 LTS patch until the Node 24 backport is released and validated.
+FROM node:22.23.2-alpine3.24 AS node-builder
 
 WORKDIR /app
 
@@ -51,11 +54,11 @@ RUN npm ci --omit=dev
 # Note: supervisord requires root to manage child processes with user= directive.
 # Both betterdesk-server and betterdesk-console run as non-root 'betterdesk' user
 # via supervisord configuration (user=betterdesk).
-FROM node:20-alpine
+FROM node:22.23.2-alpine3.24
 
 LABEL maintainer="UNITRONIX"
 LABEL description="BetterDesk — All-in-One (Go Server + Node.js Console)"
-LABEL version="3.3.170"
+LABEL version="3.5.55"
 
 # Install runtime packages (retry for transient DNS failures)
 RUN apk add --no-cache \
@@ -64,6 +67,8 @@ RUN apk add --no-cache \
     sqlite \
     tini \
     supervisor \
+    su-exec \
+    shadow \
     && mkdir -p /var/log/supervisor \
     || { sleep 2 && apk add --no-cache \
     ca-certificates \
@@ -71,6 +76,8 @@ RUN apk add --no-cache \
     sqlite \
     tini \
     supervisor \
+    su-exec \
+    shadow \
     && mkdir -p /var/log/supervisor; }
 
 # Create betterdesk user and directories
@@ -102,10 +109,11 @@ RUN printf '%s\n' "${BETTERDESK_COMMIT_SHA}" > /app/.image-commit
 COPY docker/supervisord.conf /etc/supervisor/conf.d/betterdesk.conf
 
 # ---- Entrypoint ----
+COPY docker/ensure-app-user.sh /ensure-app-user.sh
 COPY docker/entrypoint.sh /entrypoint.sh
 COPY docker/wait-panel-auth-db.sh /app/docker/wait-panel-auth-db.sh
 COPY docker/show-admin-credentials.sh /usr/local/bin/betterdesk-show-admin-credentials
-RUN chmod +x /entrypoint.sh /app/docker/wait-panel-auth-db.sh /usr/local/bin/betterdesk-show-admin-credentials
+RUN chmod +x /ensure-app-user.sh /entrypoint.sh /app/docker/wait-panel-auth-db.sh /usr/local/bin/betterdesk-show-admin-credentials
 
 # Environment variables (defaults)
 ENV NODE_ENV=production
@@ -126,7 +134,13 @@ ENV API_ENABLED=false
 ENV HBBS_API_URL=http://127.0.0.1:21121/api
 ENV BETTERDESK_API_URL=http://127.0.0.1:21121/api
 ENV DOCKER=true
-ENV ENCRYPTED_ONLY=1\nENV RELAY_SERVERS=
+ENV ENCRYPTED_ONLY=1
+ENV RELAY_SERVERS=
+# Billing clock / NTP — required by supervisord %(ENV_*)s (#299 / #223)
+ENV NTP_SERVERS=pool.ntp.org,time.google.com,time.cloudflare.com
+ENV BILLING_MAX_CLOCK_SKEW_MS=2000
+ENV BILLING_REQUIRE_SYNCED_CLOCK=1
+ENV BILLING_TRUST_OS_NTP=Y
 
 # Expose all ports
 EXPOSE 5000 21115 21116/tcp 21116/udp 21117 21118 21119 21121

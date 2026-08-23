@@ -8,15 +8,18 @@
 # Docker legacy (two-container split images):
 #   curl -fsSL .../install.sh | sudo bash -s -- --split
 #
-# Native (git clone + betterdesk.sh --auto):
+# Native stable (git clone + betterdesk.sh --auto):
 #   curl -fsSL https://raw.githubusercontent.com/UNITRONIX/BetterDesk/main/install.sh | sudo bash -s -- --native
+#
+# Native Development channel (this file on the `dev` branch defaults to --branch dev):
+#   curl -fsSL https://raw.githubusercontent.com/UNITRONIX/BetterDesk/dev/install.sh | sudo bash -s -- --native
 #
 # Options (pass after "bash -s --"):
 #   --docker | --native          Installation mode (default: docker)
 #   --split                      Legacy two-container layout (server + console images)
 #   --install-dir PATH             Install directory (default: /opt/betterdesk)
-#   --version TAG                  Docker image tag / release baseline (default: 3.3.112)
-#   --branch BRANCH                Git branch for native install (default: main)
+#   --version TAG                  Docker image tag / release baseline (default: 3.5.55)
+#   --branch BRANCH                Git branch for native install (default: this installer channel)
 #   --relay-mode auto|local|public Relay auto-detection strategy
 #   --relay-servers IP[:port]      Fixed relay address (overrides --relay-mode)
 #   --admin-password PASS          Set admin password (Docker: ADMIN_PASSWORD env)
@@ -38,8 +41,12 @@ set -euo pipefail
 
 VERSION="1.0.0"
 BETTERDESK_REPO="${BETTERDESK_REPO:-UNITRONIX/BetterDesk}"
-BETTERDESK_BRANCH="${BETTERDESK_BRANCH:-main}"
-BETTERDESK_VERSION="${BETTERDESK_VERSION:-3.3.112}"
+# Must match the GitHub branch that serves this install.sh URL
+# (.../dev/install.sh → dev, .../main/install.sh → main). Override with
+# --branch / BETTERDESK_BRANCH. Flip to "main" when releasing this file on main.
+BETTERDESK_INSTALLER_CHANNEL="dev"
+BETTERDESK_BRANCH="${BETTERDESK_BRANCH:-$BETTERDESK_INSTALLER_CHANNEL}"
+BETTERDESK_VERSION="${BETTERDESK_VERSION:-3.5.55}"
 BETTERDESK_RAW_BASE="${BETTERDESK_RAW_BASE:-https://raw.githubusercontent.com/${BETTERDESK_REPO}/${BETTERDESK_BRANCH}}"
 INSTALL_DIR="${INSTALL_DIR:-/opt/betterdesk}"
 INSTALL_MODE="docker"
@@ -79,7 +86,7 @@ warn() { echo -e "${C_YELLOW}!${C_RESET} $*" >&2; }
 die()  { echo -e "${C_RED}✗${C_RESET} $*" >&2; exit 1; }
 
 usage() {
-    sed -n '4,27p' "$0" | sed 's/^# \?//'
+    sed -n '4,33p' "$0" | sed 's/^# \?//'
     exit 0
 }
 
@@ -330,6 +337,29 @@ wait_for_http() {
     return 1
 }
 
+fetch_admin_credentials() {
+    # Prefer helper (#195); fall back to cat as betterdesk when image lacks the binary (#299).
+    local service="$1"
+    local compose_file="$INSTALL_DIR/docker/docker-compose.yml"
+    local out=""
+
+    out=$("${COMPOSE_CMD[@]}" -f "$compose_file" exec -T "$service" \
+        betterdesk-show-admin-credentials 2>/dev/null || true)
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+
+    out=$("${COMPOSE_CMD[@]}" -f "$compose_file" exec -T -u betterdesk "$service" \
+        sh -c 'cat /opt/rustdesk/.admin_credentials 2>/dev/null || cat /app/data/.admin_credentials 2>/dev/null' \
+        2>/dev/null || true)
+    if [ -n "$out" ]; then
+        printf '%s\n' "$out"
+        return 0
+    fi
+    return 1
+}
+
 print_docker_summary() {
     local relay="$1"
     local host_ip="${relay%%:*}"
@@ -340,13 +370,12 @@ print_docker_summary() {
 
     if [ "$DOCKER_LAYOUT" = "split" ]; then
         api_port="21114"
-        creds=$("${COMPOSE_CMD[@]}" -f "$INSTALL_DIR/docker/docker-compose.yml" exec -T console \
-            betterdesk-show-admin-credentials 2>/dev/null || true)
+        exec_service="console"
+        creds=$(fetch_admin_credentials console || true)
         pubkey=$("${COMPOSE_CMD[@]}" -f "$INSTALL_DIR/docker/docker-compose.yml" exec -T server \
             sh -c 'cat /opt/rustdesk/id_ed25519.pub 2>/dev/null' 2>/dev/null || true)
     else
-        creds=$("${COMPOSE_CMD[@]}" -f "$INSTALL_DIR/docker/docker-compose.yml" exec -T betterdesk \
-            betterdesk-show-admin-credentials 2>/dev/null || true)
+        creds=$(fetch_admin_credentials betterdesk || true)
         pubkey=$("${COMPOSE_CMD[@]}" -f "$INSTALL_DIR/docker/docker-compose.yml" exec -T betterdesk \
             sh -c 'cat /opt/rustdesk/id_ed25519.pub 2>/dev/null' 2>/dev/null || true)
     fi
@@ -441,8 +470,12 @@ EOF
     configure_firewall
 
     log "Waiting for services..."
-    wait_for_http "$api_health_url" "BetterDesk API" 90 || true
-    wait_for_http "http://127.0.0.1:5000/login" "Web console" 60 || true
+    local health_failed=0
+    wait_for_http "$api_health_url" "BetterDesk API" 90 || health_failed=1
+    wait_for_http "http://127.0.0.1:5000/login" "Web console" 60 || health_failed=1
+    if [ "$health_failed" -ne 0 ]; then
+        die "BetterDesk containers did not pass health checks; inspect ${compose_dir}/docker-compose.yml logs before retrying"
+    fi
 
     print_docker_summary "$relay"
 }
@@ -503,23 +536,34 @@ uninstall_docker_mode() {
 install_native_mode() {
     local repo_dir="${INSTALL_DIR}/source"
     local relay
+    local commit_sha
 
     log "BetterDesk native installer v${VERSION}"
+    log "Native install branch: ${BETTERDESK_BRANCH} (override with --branch)"
 
     require_command git
     relay=$(resolve_relay_address)
 
     if [ -d "$repo_dir/.git" ]; then
-        log "Updating existing clone in ${repo_dir}..."
+        log "Updating existing clone in ${repo_dir} to ${BETTERDESK_BRANCH}..."
+        git -C "$repo_dir" remote set-url origin "https://github.com/${BETTERDESK_REPO}.git" || true
         git -C "$repo_dir" fetch --depth 1 origin "$BETTERDESK_BRANCH"
-        git -C "$repo_dir" checkout "$BETTERDESK_BRANCH"
-        git -C "$repo_dir" pull --ff-only origin "$BETTERDESK_BRANCH" || true
+        # Shallow clones previously pinned to another branch need a hard reset.
+        if ! git -C "$repo_dir" checkout -B "$BETTERDESK_BRANCH" "FETCH_HEAD"; then
+            warn "Could not switch existing clone to ${BETTERDESK_BRANCH}; recloning..."
+            rm -rf "$repo_dir"
+            git clone --depth 1 --branch "$BETTERDESK_BRANCH" \
+                "https://github.com/${BETTERDESK_REPO}.git" "$repo_dir"
+        fi
     else
         log "Cloning ${BETTERDESK_REPO} (${BETTERDESK_BRANCH})..."
         rm -rf "$repo_dir"
         git clone --depth 1 --branch "$BETTERDESK_BRANCH" \
             "https://github.com/${BETTERDESK_REPO}.git" "$repo_dir"
     fi
+
+    commit_sha=$(git -C "$repo_dir" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    log "Using ${BETTERDESK_REPO}@${BETTERDESK_BRANCH} (${commit_sha})"
 
     chmod +x "${repo_dir}/betterdesk.sh"
 
@@ -531,6 +575,23 @@ install_native_mode() {
     (cd "$repo_dir" && ./betterdesk.sh --auto --relay-servers "$relay")
 
     ok "Native installation finished. See ${repo_dir} for logs and credentials."
+}
+
+uninstall_native_mode() {
+    local repo_dir="${INSTALL_DIR}/source"
+    local native_installer="${repo_dir}/betterdesk.sh"
+
+    require_root
+    if [ ! -x "$native_installer" ]; then
+        die "Native installer not found at ${native_installer}; nothing was removed"
+    fi
+
+    log "Running native uninstall (data is preserved unless --purge is supplied)..."
+    local args=(--auto --uninstall)
+    if [ "$DO_PURGE" = true ]; then
+        args+=(--purge)
+    fi
+    (cd "$repo_dir" && "$native_installer" "${args[@]}")
 }
 
 rescue_native_mode() {
@@ -555,7 +616,11 @@ main() {
     echo ""
 
     if [ "$DO_UNINSTALL" = true ]; then
-        uninstall_docker_mode
+        case "$INSTALL_MODE" in
+            docker) uninstall_docker_mode ;;
+            native) uninstall_native_mode ;;
+            *) die "Unknown install mode: $INSTALL_MODE" ;;
+        esac
         exit 0
     fi
 

@@ -15,24 +15,20 @@
         initUserMenu();
         initRefreshButton();
         initRegistrationBadge();
-        initDesktopMode();
     }
-    
+
     /**
-     * Sidebar functionality (mobile support)
+     * Classic rail sidebar — mobile overlay support
      */
     function initSidebar() {
         const sidebar = document.getElementById('sidebar');
         const overlay = document.getElementById('sidebar-overlay');
-        
         if (!sidebar) return;
-        
-        // Close sidebar on overlay click (legacy desktop sidebar)
+
         overlay?.addEventListener('click', () => {
             sidebar.classList.remove('open');
         });
 
-        // Close sidebar when navigating (legacy)
         sidebar.querySelectorAll('.sidebar-link, .sidebar-rail-btn[href]').forEach(link => {
             link.addEventListener('click', () => {
                 if (window.innerWidth <= 1024) {
@@ -40,8 +36,7 @@
                 }
             });
         });
-        
-        // Mobile menu button (hidden when mobile-shell uses bottom nav More)
+
         const mobileMenuBtn = document.getElementById('mobile-menu-btn');
         if (mobileMenuBtn) {
             mobileMenuBtn.addEventListener('click', () => {
@@ -51,7 +46,7 @@
                 }
                 sidebar.classList.toggle('open');
             });
-            
+
             function checkMobile() {
                 const useLegacy = window.innerWidth <= 1024
                     && !(window.DeviceCapabilities && window.DeviceCapabilities.isMobileShell());
@@ -77,9 +72,14 @@
                 e.stopPropagation();
                 // Close other dropdowns
                 document.querySelectorAll('.lang-dropdown.open').forEach(d => {
-                    if (d !== dropdown) d.classList.remove('open');
+                    if (d !== dropdown) {
+                        d.classList.remove('open');
+                        d.parentElement?.querySelector('button')?.setAttribute('aria-expanded', 'false');
+                    }
                 });
-                dropdown.classList.toggle('open');
+                const open = !dropdown.classList.contains('open');
+                dropdown.classList.toggle('open', open);
+                btn.setAttribute('aria-expanded', String(open));
             });
         });
         
@@ -87,6 +87,7 @@
         document.addEventListener('click', () => {
             document.querySelectorAll('.lang-dropdown.open').forEach(d => {
                 d.classList.remove('open');
+                d.parentElement?.querySelector('button')?.setAttribute('aria-expanded', 'false');
             });
         });
     }
@@ -143,6 +144,14 @@
                     Notifications.error(_('errors.logout_failed'));
                 }
             }
+        });
+
+        [changePasswordBtn, logoutBtn].filter(Boolean).forEach(btn => {
+            btn.addEventListener('keydown', (event) => {
+                if (event.key !== 'Enter' && event.key !== ' ') return;
+                event.preventDefault();
+                btn.click();
+            });
         });
     }
     
@@ -206,15 +215,6 @@
 
         updateBadge();
         badgeInterval = setInterval(updateBadge, 30000); // every 30s
-    }
-    
-    /**
-     * Desktop mode initialization
-     */
-    function initDesktopMode() {
-        if (window.DesktopMode && typeof window.DesktopMode.init === 'function') {
-            window.DesktopMode.init();
-        }
     }
     
 })();

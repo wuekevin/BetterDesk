@@ -1,7 +1,7 @@
 #!/bin/bash
 #===============================================================================
 #
-#   BetterDesk Console Manager v3.3.170
+#   BetterDesk Console Manager v3.5.55
 #   All-in-One Interactive Tool for Linux
 #
 #   Features:
@@ -36,9 +36,9 @@
 set -e
 
 # Version
-VERSION="3.3.170"
+VERSION="3.5.55"
 # Bump when installer control-flow changes must apply mid-session after Update (#219).
-BETTERDESK_SH_REVISION="20260718-reexec"
+BETTERDESK_SH_REVISION="20260725-console-start-306"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Preserve argv before shift — used to re-exec after installer self-update (#219).
 BETTERDESK_ORIG_ARGV=("$@")
@@ -47,6 +47,8 @@ BETTERDESK_ORIG_ARGV=("$@")
 AUTO_MODE=false
 SKIP_VERIFY=false
 MINIMAL_MODE=false
+UNINSTALL_MODE=false
+PURGE_MODE=false
 PREFERRED_CONSOLE_TYPE="nodejs"  # Always Node.js (Flask removed in v2.3.0)
 
 # Relay server selection mode:
@@ -69,6 +71,14 @@ while [[ $# -gt 0 ]]; do
             ;;
         --minimal)
             MINIMAL_MODE=true
+            shift
+            ;;
+        --uninstall)
+            UNINSTALL_MODE=true
+            shift
+            ;;
+        --purge)
+            PURGE_MODE=true
             shift
             ;;
         --nodejs)
@@ -117,6 +127,8 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "Options:"
             echo "  --auto, -a       Run in automatic mode (non-interactive)"
+            echo "  --uninstall      Stop services and remove the native installation"
+            echo "  --purge          With --uninstall, also remove data and keys"
             echo "  --skip-verify    Skip SHA256 verification of binaries"
             echo "  --minimal        Install Go server only (no web console)"
             echo "  --nodejs         Install Node.js web console (default)"
@@ -151,10 +163,18 @@ done
 # Go server source directory
 GO_SERVER_SOURCE="$SCRIPT_DIR/betterdesk-server"
 
-# Minimum Go version required for compilation
-GO_MIN_VERSION="1.25"
+# Minimum Go version required for compilation (must match betterdesk-server/go.mod).
+GO_MIN_VERSION="1.26.6"
 # Point release downloaded when system Go is missing/outdated (must exist on go.dev/dl).
-GO_DOWNLOAD_VERSION="1.26.4"
+GO_DOWNLOAD_VERSION="1.26.6"
+# Maximum time allowed for the first module download on a native install.
+GO_MODULE_DOWNLOAD_TIMEOUT="${GO_MODULE_DOWNLOAD_TIMEOUT:-600}"
+# Short HTTPS probe before go mod download (fail fast on blocked proxy/DNS).
+GO_MODULE_PREFLIGHT_TIMEOUT="${GO_MODULE_PREFLIGHT_TIMEOUT:-20}"
+# Set when preflight detects IPv4 OK but IPv6 broken (common on GCP VMs).
+GO_FORCE_IPV4=0
+# Toolchain for native compile (override with BETTERDESK_GOTOOLCHAIN; default local).
+BETTERDESK_GOTOOLCHAIN="${BETTERDESK_GOTOOLCHAIN:-local}"
 
 # Default paths (can be overridden by environment variables)
 RUSTDESK_PATH="${RUSTDESK_PATH:-}"
@@ -880,8 +900,11 @@ resolve_le_cert_live_dir() {
     echo "$le_live_dir"
 }
 
-# Copy a TLS file to dest as a real file (not a symlink). Removes dest when it
-# already resolves to the same path as src — cp -L otherwise fails with "same file" (#219).
+# Copy a TLS file to dest as a real file (not a symlink).
+# - If dest is already the same real file as src (self-signed generated in place),
+#   do nothing — deleting dest would remove src and break cp (#325, discussion #322).
+# - If dest is a symlink that resolves to src (LE live dir), remove the symlink
+#   and copy content so the console user can read it (#219).
 _safe_cp_tls_file() {
     local src="$1"
     local dest="$2"
@@ -892,7 +915,13 @@ _safe_cp_tls_file() {
     if [ -e "$dest" ]; then
         dest_real=$(readlink -f "$dest" 2>/dev/null || echo "$dest")
         if [ "$src_real" = "$dest_real" ]; then
-            rm -f "$dest"
+            if [ -L "$dest" ]; then
+                # Symlink to src → replace with a real copy (#219)
+                rm -f "$dest"
+            else
+                # Already a real file at dest (self-signed path) — no copy needed (#325)
+                return 0
+            fi
         fi
     fi
     tmp="${dest}.betterdesk.$$.tmp"
@@ -1845,19 +1874,18 @@ prepare_console_after_update() {
         return 0
     fi
     systemctl reset-failed betterdesk-console 2>/dev/null || true
-    repair_console_service_user_line "betterdesk"
-    repair_https_stuck_state yes
+    repair_console_service_user_line "betterdesk" || true
+    repair_https_stuck_state yes || true
     if [ -f "$CONSOLE_PATH/scripts/linux-ensure-console-user.js" ] && command -v node &>/dev/null; then
         if [ "$(id -u)" -eq 0 ]; then
             node "$CONSOLE_PATH/scripts/linux-ensure-console-user.js" || print_warning "Console permission sync reported issues"
-        elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
-            sudo -n node "$CONSOLE_PATH/scripts/linux-ensure-console-user.js" || print_warning "Console permission sync reported issues"
         else
-            print_warning "Console permission sync skipped (run as root: sudo node $CONSOLE_PATH/scripts/linux-ensure-console-user.js)"
+            print_warning "Console permission sync skipped; run linux-ensure-console-user.js as root"
         fi
     fi
-    repair_console_service_user_line "betterdesk"
+    repair_console_service_user_line "betterdesk" || true
     ensure_console_tls_material_readable 2>/dev/null || true
+    return 0
 }
 
 maybe_create_admin_user_on_update() {
@@ -1868,11 +1896,42 @@ maybe_create_admin_user_on_update() {
     create_admin_user
 }
 
+# Start / restart betterdesk-console and verify panel health (#306).
+# Always attempts start even when earlier helper steps failed (set -e safe).
+start_betterdesk_console_verified() {
+    local panel_port console_state
+    panel_port=$(resolve_panel_health_port)
+
+    print_info "Starting betterdesk-console (Node.js)..."
+    systemctl reset-failed betterdesk-console 2>/dev/null || true
+    if systemctl is-active --quiet betterdesk-console 2>/dev/null; then
+        systemctl restart betterdesk-console || true
+    else
+        # Prefer start when inactive (post graceful_stop); fall back to restart.
+        systemctl start betterdesk-console 2>/dev/null || systemctl restart betterdesk-console || true
+    fi
+    sleep 2
+
+    if ! verify_service_health "betterdesk-console" "$panel_port" 10; then
+        print_warning "Web console may not be running correctly"
+        console_state=$(systemctl show betterdesk-console --property=ActiveState --value 2>/dev/null || echo "unknown")
+        print_error "betterdesk-console ActiveState=${console_state} (expected: active)"
+        print_info "  Possible causes: npm modules, TLS key permissions, port ${panel_port} conflict"
+        print_info "Run: journalctl -u betterdesk-console -n 50 --no-pager"
+        print_info "Then: sudo systemctl start betterdesk-console"
+        return 1
+    fi
+
+    print_success "betterdesk-console started and healthy (port ${panel_port})"
+    return 0
+}
+
 # Start services with health verification
 start_services_with_verification() {
     print_step "Starting services with health verification..."
     
     local has_errors=false
+    local console_ok=true
     
     # Check ports before starting
     if ! check_port_available "21116" "signal"; then
@@ -1903,22 +1962,29 @@ start_services_with_verification() {
         print_error "Failed to start betterdesk-server"
         print_info "Service state: $(systemctl show betterdesk-server --property=ActiveState --value 2>/dev/null)"
         print_info "Run: journalctl -u betterdesk-server -n 50 --no-pager"
+        # Still try to bring console up — operator may recover Go separately (#306)
+        prepare_console_after_update || true
+        start_betterdesk_console_verified || true
         return 1
     fi
     print_success "betterdesk-server started and healthy"
     
-    # Inject shared API key into Go server database for Node.js ↔ Go communication
+    # Inject shared API key into Go server database for Node.js ↔ Go communication.
+    # Must not abort under set -e (sqlite3 busy/locked after Go start was leaving Console down — #306).
     local api_key_file="$RUSTDESK_PATH/.api_key"
     if [ -f "$api_key_file" ]; then
         local api_key
-        api_key=$(cat "$api_key_file")
-        local api_key_sql
-        api_key_sql=$(sql_escape_literal "$api_key")
+        api_key=$(cat "$api_key_file" 2>/dev/null || true)
+        local api_key_sql=""
+        if [ -n "$api_key" ]; then
+            api_key_sql=$(sql_escape_literal "$api_key")
+        fi
         local go_db="$RUSTDESK_PATH/db_v2.sqlite3"
-        if [ -f "$go_db" ] && command -v sqlite3 &>/dev/null; then
-            sqlite3 "$go_db" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key_sql');" 2>/dev/null
-            if [ $? -eq 0 ]; then
+        if [ -n "$api_key_sql" ] && [ -f "$go_db" ] && command -v sqlite3 &>/dev/null; then
+            if sqlite3 "$go_db" "INSERT OR REPLACE INTO server_config (key, value) VALUES ('api_key', '$api_key_sql');" 2>/dev/null; then
                 print_info "API key synced to Go server database"
+            else
+                print_warning "API key sync to Go DB skipped (sqlite3 failed — Console start continues)"
             fi
         fi
     fi
@@ -1929,39 +1995,22 @@ start_services_with_verification() {
     fi
 
     # Re-sync permissions after Go server may have created root-owned DB/WAL files (#206)
-    prepare_console_after_update
-    
-    # Start Node.js console
-    local panel_port console_ok=true
-    panel_port=$(resolve_panel_health_port)
+    # Never abort start path under set -e (#306)
+    prepare_console_after_update || print_warning "Console prep after update reported issues (continuing)"
 
-    print_info "Starting betterdesk-console (Node.js)..."
-    systemctl restart betterdesk-console
-    sleep 2
-
-    if ! verify_service_health "betterdesk-console" "$panel_port" 10; then
+    if ! start_betterdesk_console_verified; then
         console_ok=false
-        print_warning "Web console may not be running correctly"
-        local console_state
-        console_state=$(systemctl show betterdesk-console --property=ActiveState --value 2>/dev/null)
-        if [ "$console_state" = "failed" ]; then
-            print_error "Console service FAILED. Possible causes:"
-            print_info "  - Missing npm modules (npm install failed)"
-            print_info "  - TLS certificate issue (self-signed cert rejected)"
-            print_info "  - Port ${panel_port} conflict"
-            print_info "Run: journalctl -u betterdesk-console -n 50 --no-pager"
-        fi
-    else
-        print_success "betterdesk-console started and healthy (port ${panel_port})"
     fi
 
     if [ "$console_ok" = true ]; then
         print_success "All services started and verified"
-    else
-        print_warning "Server is running but web console needs attention"
-        print_info "Run: journalctl -u betterdesk-console -n 50 --no-pager"
+        return 0
     fi
-    return 0
+
+    print_error "Server is running but web console failed to start"
+    print_info "Run: journalctl -u betterdesk-console -n 50 --no-pager"
+    print_info "Then: sudo systemctl start betterdesk-console"
+    return 1
 }
 
 #===============================================================================
@@ -2514,6 +2563,7 @@ check_go_installed() {
         local go_patch=$(_go_version_part "$go_version" 3)
         local min_major=$(_go_version_part "$GO_MIN_VERSION" 1)
         local min_minor=$(_go_version_part "$GO_MIN_VERSION" 2)
+        local min_patch=$(_go_version_part "$GO_MIN_VERSION" 3)
 
         # Security hardening: reject vulnerable Go 1.26.0 stdlib.
         if [ "$go_major" -eq 1 ] && [ "$go_minor" -eq 26 ] && [ "$go_patch" -eq 0 ]; then
@@ -2521,7 +2571,9 @@ check_go_installed() {
             return 1
         fi
         
-        if [ "$go_major" -gt "$min_major" ] || ([ "$go_major" -eq "$min_major" ] && [ "$go_minor" -ge "$min_minor" ]); then
+        if [ "$go_major" -gt "$min_major" ] ||
+           ([ "$go_major" -eq "$min_major" ] && [ "$go_minor" -gt "$min_minor" ]) ||
+           ([ "$go_major" -eq "$min_major" ] && [ "$go_minor" -eq "$min_minor" ] && [ "$go_patch" -ge "$min_patch" ]); then
             return 0
         fi
     fi
@@ -2590,6 +2642,304 @@ install_golang() {
     fi
 }
 
+# Probe a fixed HTTPS host without executing response body (connectivity only).
+# Optional 3rd arg: curl IP family flag ("-4" or "-6"); empty = dual-stack default.
+_go_probe_https() {
+    local url="$1"
+    local limit="${2:-$GO_MODULE_PREFLIGHT_TIMEOUT}"
+    local ip_flag="${3:-}"
+
+    if command -v curl &> /dev/null; then
+        # No -f: any HTTP response means the TCP/TLS path works (404 is fine).
+        # shellcheck disable=SC2086
+        curl -sS -o /dev/null --connect-timeout "$limit" --max-time "$limit" $ip_flag "$url"
+        return $?
+    fi
+    if command -v wget &> /dev/null; then
+        # wget has no reliable -4/-6 on all distros; dual-stack only.
+        wget -q --spider --timeout="$limit" --tries=1 "$url"
+        return $?
+    fi
+    return 2
+}
+
+# Read a sysctl value or echo "unknown".
+_go_sysctl_get() {
+    local key="$1"
+    if command -v sysctl &> /dev/null; then
+        sysctl -n "$key" 2>/dev/null || echo "unknown"
+    else
+        echo "unknown"
+    fi
+}
+
+# Temporarily disable IPv6 for Go dual-stack dials on broken-IPv6 VMs (save/restore).
+_go_ipv4_force_begin() {
+    GO_IPV4_SAVED_ALL=""
+    GO_IPV4_SAVED_DEFAULT=""
+    GO_IPV4_APPLIED=0
+
+    if [ "${GO_FORCE_IPV4:-0}" != "1" ]; then
+        return 0
+    fi
+    if ! command -v sysctl &> /dev/null; then
+        print_warning "Broken IPv6 detected but sysctl unavailable; cannot force IPv4 for Go"
+        return 0
+    fi
+
+    GO_IPV4_SAVED_ALL=$(_go_sysctl_get net.ipv6.conf.all.disable_ipv6)
+    GO_IPV4_SAVED_DEFAULT=$(_go_sysctl_get net.ipv6.conf.default.disable_ipv6)
+
+    if sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 \
+        && sysctl -w net.ipv6.conf.default.disable_ipv6=1 >/dev/null 2>&1; then
+        GO_IPV4_APPLIED=1
+        print_info "Temporarily disabled IPv6 for Go module download (broken IPv6 path detected)"
+    else
+        print_warning "Could not disable IPv6 via sysctl; Go may still hang on AAAA dials"
+    fi
+}
+
+_go_ipv4_force_end() {
+    if [ "${GO_IPV4_APPLIED:-0}" != "1" ]; then
+        return 0
+    fi
+    if [ -n "${GO_IPV4_SAVED_ALL}" ] && [ "${GO_IPV4_SAVED_ALL}" != "unknown" ]; then
+        sysctl -w "net.ipv6.conf.all.disable_ipv6=${GO_IPV4_SAVED_ALL}" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${GO_IPV4_SAVED_DEFAULT}" ] && [ "${GO_IPV4_SAVED_DEFAULT}" != "unknown" ]; then
+        sysctl -w "net.ipv6.conf.default.disable_ipv6=${GO_IPV4_SAVED_DEFAULT}" >/dev/null 2>&1 || true
+    fi
+    GO_IPV4_APPLIED=0
+    print_info "Restored previous IPv6 sysctl settings"
+}
+
+# Drop leftover partial/lock files from a previous Ctrl+C during go mod download.
+_go_clear_stale_module_partials() {
+    local modcache
+    modcache=$(go env GOMODCACHE 2>/dev/null || true)
+    if [ -z "$modcache" ] || [ ! -d "$modcache" ]; then
+        return 0
+    fi
+    local cleared=0
+    cleared=$(find "$modcache" \( -name '*.partial' -o -name '*.lock' \) 2>/dev/null | wc -l | tr -d ' ')
+    if [ "${cleared:-0}" -gt 0 ] 2>/dev/null; then
+        print_warning "Removing ${cleared} stale Go module cache lock/partial file(s) from a prior interrupted download"
+        find "$modcache" \( -name '*.partial' -o -name '*.lock' \) -delete 2>/dev/null || true
+    fi
+}
+
+# Fail fast when proxy.golang.org / sum.golang.org are unreachable.
+# Prefer IPv4 probes; set GO_FORCE_IPV4=1 when IPv6 is broken but IPv4 works.
+_go_module_network_preflight() {
+    local limit="${GO_MODULE_PREFLIGHT_TIMEOUT}"
+    local probe_status=0
+    local ipv4_ok=0
+    local ipv6_ok=0
+
+    GO_FORCE_IPV4=0
+    print_info "Checking HTTPS reachability of Go module endpoints (${limit}s)..."
+
+    if ! command -v curl &> /dev/null && ! command -v wget &> /dev/null; then
+        print_warning "Neither curl nor wget available; skipping Go module network preflight"
+        return 0
+    fi
+
+    if command -v curl &> /dev/null; then
+        if _go_probe_https "https://proxy.golang.org/" "$limit" "-4"; then
+            ipv4_ok=1
+            print_success "Reachable via IPv4: proxy.golang.org"
+        else
+            print_error "Cannot reach https://proxy.golang.org/ via IPv4 within ${limit}s"
+        fi
+
+        # Short IPv6 probe — failure here is common on GCP and is not fatal if IPv4 works.
+        if _go_probe_https "https://proxy.golang.org/" 5 "-6"; then
+            ipv6_ok=1
+            print_success "Reachable via IPv6: proxy.golang.org"
+        else
+            print_warning "IPv6 path to proxy.golang.org failed (will prefer IPv4 for Go if IPv4 works)"
+        fi
+
+        if [ "$ipv4_ok" -eq 1 ] && [ "$ipv6_ok" -eq 0 ]; then
+            GO_FORCE_IPV4=1
+            print_info "Broken IPv6 detected — Go module download will temporarily disable IPv6"
+        fi
+
+        if [ "$ipv4_ok" -ne 1 ]; then
+            # Last resort: dual-stack (some hosts lack curl -4).
+            if _go_probe_https "https://proxy.golang.org/" "$limit"; then
+                print_success "Reachable (dual-stack): proxy.golang.org"
+            else
+                probe_status=1
+            fi
+        fi
+
+        if ! _go_probe_https "https://sum.golang.org/" "$limit" "-4" \
+            && ! _go_probe_https "https://sum.golang.org/" "$limit"; then
+            print_error "Cannot reach https://sum.golang.org/ within ${limit}s"
+            probe_status=1
+        else
+            print_success "Reachable: sum.golang.org"
+        fi
+
+        # GET a tiny known proxy path so HEAD-only reachability cannot hide a hung download path.
+        if [ "$probe_status" -eq 0 ]; then
+            print_info "Probing Go module proxy GET (sample @v/list)..."
+            if ! curl -4 -sS -o /dev/null --connect-timeout "$limit" --max-time 30 \
+                "https://proxy.golang.org/github.com/google/uuid/@v/list"; then
+                print_error "Go module proxy GET probe failed within 30s"
+                print_error "HEAD may work while module downloads hang — check firewall/DPI/IPv6"
+                probe_status=1
+            else
+                print_success "Go module proxy GET probe OK"
+            fi
+        fi
+    else
+        if ! _go_probe_https "https://proxy.golang.org/" "$limit"; then
+            print_error "Cannot reach https://proxy.golang.org/ within ${limit}s"
+            probe_status=1
+        else
+            print_success "Reachable: proxy.golang.org"
+        fi
+        if ! _go_probe_https "https://sum.golang.org/" "$limit"; then
+            print_error "Cannot reach https://sum.golang.org/ within ${limit}s"
+            probe_status=1
+        else
+            print_success "Reachable: sum.golang.org"
+        fi
+    fi
+
+    if [ "$probe_status" -ne 0 ]; then
+        print_error "Outbound HTTPS to the Go module proxy/checksum DB is blocked or timing out"
+        print_error "On cloud VMs check DNS, firewall/egress, IPv6 blackholes, and GOPROXY — then retry"
+        print_error "Override example: GOPROXY=https://proxy.golang.org,direct"
+        return 1
+    fi
+    return 0
+}
+
+# Kill a process group (negative PGID) with TERM then KILL.
+_go_kill_process_group() {
+    local pgid="$1"
+    local label="${2:-process group}"
+
+    if [ -z "$pgid" ] || [ "$pgid" -le 1 ] 2>/dev/null; then
+        return 0
+    fi
+    print_error "Stopping ${label} (PGID ${pgid}) with SIGTERM..."
+    kill -TERM -- "-${pgid}" 2>/dev/null || kill -TERM "$pgid" 2>/dev/null || true
+    sleep 2
+    if kill -0 "$pgid" 2>/dev/null; then
+        print_error "Still alive — sending SIGKILL to PGID ${pgid}"
+        kill -KILL -- "-${pgid}" 2>/dev/null || kill -KILL "$pgid" 2>/dev/null || true
+    fi
+}
+
+# Run go mod download with a hard bash process-group deadline (primary guard).
+# GNU timeout alone was insufficient on some cloud VMs (#371).
+_run_go_mod_download_bounded() {
+    local deadline="${GO_MODULE_DOWNLOAD_TIMEOUT}"
+    local kill_after=15
+    local status=0
+    local waiter_pid=""
+    local download_pid=""
+    local download_pgid=""
+    local elapsed=0
+    local heartbeat_pid=""
+    local pidfile=""
+    local use_setsid_w=0
+
+    _go_ipv4_force_begin
+    trap '_go_ipv4_force_end' EXIT
+    _go_clear_stale_module_partials
+
+    pidfile=$(mktemp 2>/dev/null || echo "/tmp/betterdesk-gomod-$$.pid")
+    : > "$pidfile"
+
+    # Heartbeat — no `local` inside non-function subshell (set -e).
+    (
+        elapsed=0
+        while true; do
+            sleep 15
+            elapsed=$((elapsed + 15))
+            printf 'ℹ  still downloading Go modules... %ss elapsed (watchdog active)\n' "$elapsed" >&2
+        done
+    ) &
+    heartbeat_pid=$!
+
+    # Isolate go in its own session so TERM/KILL cannot hit the installer PGID.
+    # Child writes $$ then exec's go (same PID = session/process-group leader).
+    # Prefer setsid -w so the background waiter stays our child and wait(1) works.
+    if command -v setsid &> /dev/null && setsid -w true >/dev/null 2>&1; then
+        use_setsid_w=1
+        setsid -w bash -c 'echo $$ > "$1"; exec go mod download -x' _ "$pidfile" &
+        waiter_pid=$!
+    elif command -v setsid &> /dev/null; then
+        setsid bash -c 'echo $$ > "$1"; exec go mod download -x' _ "$pidfile" &
+        waiter_pid=$!
+    else
+        bash -c 'echo $$ > "$1"; exec go mod download -x' _ "$pidfile" &
+        waiter_pid=$!
+    fi
+
+    elapsed=0
+    while [ ! -s "$pidfile" ] && [ "$elapsed" -lt 50 ]; do
+        sleep 0.1
+        elapsed=$((elapsed + 1))
+    done
+    download_pid=$(tr -d ' \n\t' < "$pidfile" 2>/dev/null || true)
+    rm -f "$pidfile"
+    if [ -z "$download_pid" ]; then
+        download_pid="$waiter_pid"
+    fi
+    download_pgid="$download_pid"
+
+    print_info "go mod download started (PID ${download_pid}, PGID ${download_pgid}, deadline ${deadline}s)"
+
+    elapsed=0
+    while kill -0 "$download_pid" 2>/dev/null; do
+        if [ "$elapsed" -ge "$deadline" ]; then
+            print_error "Go module download exceeded ${deadline}s"
+            _go_kill_process_group "$download_pgid" "go mod download"
+            sleep "$kill_after"
+            if kill -0 "$download_pid" 2>/dev/null; then
+                kill -KILL "$download_pid" 2>/dev/null || true
+            fi
+            status=124
+            break
+        fi
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+
+    if [ "$status" -eq 124 ]; then
+        wait "$waiter_pid" 2>/dev/null || true
+    elif [ "$use_setsid_w" -eq 1 ] || [ "$waiter_pid" = "$download_pid" ]; then
+        if wait "$waiter_pid"; then
+            status=0
+        else
+            status=$?
+        fi
+    else
+        # setsid without -w: waiter already exited; go may be reparented — poll only.
+        if kill -0 "$download_pid" 2>/dev/null; then
+            status=1
+        else
+            status=0
+        fi
+        wait "$waiter_pid" 2>/dev/null || true
+    fi
+
+    if [ -n "$heartbeat_pid" ]; then
+        kill "$heartbeat_pid" 2>/dev/null || true
+        wait "$heartbeat_pid" 2>/dev/null || true
+    fi
+
+    trap - EXIT
+    _go_ipv4_force_end
+    return "$status"
+}
+
 compile_go_server() {
     print_step "Compiling BetterDesk Go server..."
     
@@ -2616,10 +2966,40 @@ compile_go_server() {
     # Build
     print_info "Building BetterDesk server for $ARCH_NAME..."
     local output_name="betterdesk-server"
-    
-    # Download dependencies
-    print_info "Downloading Go modules..."
-    go mod download
+    local go_bin
+    go_bin=$(command -v go)
+
+    # Force local toolchain for native compile so host GOTOOLCHAIN=auto cannot
+    # silently download another toolchain mid-install (hang risk on cloud VMs).
+    # Override with BETTERDESK_GOTOOLCHAIN if needed. GOPROXY/GOSUMDB still honour env.
+    export GOTOOLCHAIN="${BETTERDESK_GOTOOLCHAIN:-local}"
+    export GOPROXY="${GOPROXY:-https://proxy.golang.org,direct}"
+    export GOSUMDB="${GOSUMDB:-sum.golang.org}"
+
+    print_info "Using $($go_bin version 2>/dev/null || echo 'unknown go')"
+    print_info "GOPROXY=${GOPROXY} GOSUMDB=${GOSUMDB} GOTOOLCHAIN=${GOTOOLCHAIN}"
+
+    if ! _go_module_network_preflight; then
+        return 1
+    fi
+
+    # Download dependencies. Keep this visible and hard-bounded (bash PGID watchdog).
+    print_info "Downloading Go modules (timeout: ${GO_MODULE_DOWNLOAD_TIMEOUT}s, kill-after: 15s, setsid watchdog)..."
+    local module_download_status=0
+    if ! _run_go_mod_download_bounded; then
+        module_download_status=$?
+    fi
+
+    if [ "$module_download_status" -ne 0 ]; then
+        if [ "$module_download_status" -eq 124 ] || [ "$module_download_status" -eq 137 ]; then
+            print_error "Go module download timed out after ${GO_MODULE_DOWNLOAD_TIMEOUT}s"
+        else
+            print_error "Go module download failed (exit code ${module_download_status})"
+        fi
+        print_error "Check DNS, outbound HTTPS to proxy.golang.org / sum.golang.org / go.dev, firewall and GOPROXY, then retry"
+        print_error "On GCP/cloud VMs with broken IPv6, confirm IPv4 works: curl -4 -I https://proxy.golang.org/"
+        return 1
+    fi
     
     # Build with optimizations
     CGO_ENABLED=0 go build -ldflags="-s -w -X main.Version=${VERSION}" -o "$output_name" .
@@ -2963,15 +3343,17 @@ install_nodejs() {
     # Check if Node.js is already installed and version is sufficient
     if command -v node &> /dev/null; then
         local node_version=$(node --version | sed 's/v//' | cut -d'.' -f1)
-        if [ "$node_version" -ge 18 ]; then
+        if [ "$node_version" -ge 22 ]; then
             print_success "Node.js v$(node --version) already installed"
             return 0
         else
-            print_warning "Node.js version $node_version is too old (need 18+). Upgrading..."
+            print_warning "Node.js version $node_version is too old (need 22+). Upgrading..."
         fi
     fi
     
-    print_step "Installing Node.js 20 LTS..."
+    # Keep new bare-metal console installs on Node 22 while Node 24.19.x
+    # cleanup-hook crashes affect native better-sqlite3 statement finalizers.
+    print_step "Installing Node.js 22 LTS..."
 
     # Detect OS and install Node.js. The NodeSource setup script is downloaded
     # to a temp file and validated before execution (H5 audit fix): we do NOT
@@ -3029,15 +3411,15 @@ install_nodejs() {
     # Detect OS and install Node.js
     if command -v apt-get &> /dev/null; then
         # Debian/Ubuntu - use NodeSource
-        _fetch_and_run_nodesource "https://deb.nodesource.com/setup_20.x" || return 1
+        _fetch_and_run_nodesource "https://deb.nodesource.com/setup_22.x" || return 1
         apt-get install -y -qq nodejs
     elif command -v dnf &> /dev/null; then
         # Fedora/RHEL 8+
-        _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_20.x" || return 1
+        _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_22.x" || return 1
         dnf install -y -q nodejs
     elif command -v yum &> /dev/null; then
         # RHEL/CentOS 7
-        _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_20.x" || return 1
+        _fetch_and_run_nodesource "https://rpm.nodesource.com/setup_22.x" || return 1
         yum install -y -q nodejs
     elif command -v pacman &> /dev/null; then
         # Arch Linux
@@ -3046,7 +3428,7 @@ install_nodejs() {
         # Alpine Linux
         apk add --no-cache nodejs npm
     else
-        print_error "Cannot install Node.js automatically. Please install Node.js 18+ manually."
+        print_error "Cannot install Node.js automatically. Please install Node.js 22+ manually."
         return 1
     fi
     
@@ -3121,10 +3503,8 @@ install_nodejs_console() {
     fi
     rm -f "$npm_log"
 
-    # Server Management Terminal sudo hint (BETA — manual step, NOT automated):
-    #   echo 'betterdesk-console ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/journalctl' \
-    #       | sudo tee /etc/sudoers.d/betterdesk-console
-    # The installer never modifies sudoers; admins opt in manually.
+    # Do not suggest a broad systemctl/journalctl sudoers rule here. The
+    # privileged update broker is the only supported panel elevation path.
     echo ""
     
     # Create data directory for databases
@@ -3496,17 +3876,15 @@ patch_service_definitions() {
         content=$(cat "$console_svc")
         new_content=$(printf '%s' "$content" \
             | sed 's|Environment=HBBS_API_URL=https://localhost|Environment=HBBS_API_URL=http://localhost|g' \
-            | sed 's|Environment=BETTERDESK_API_URL=https://localhost|Environment=BETTERDESK_API_URL=http://localhost|g')
+            | sed 's|Environment=BETTERDESK_API_URL=https://localhost|Environment=BETTERDESK_API_URL=http://localhost|g' \
+            | sed '/^ExecStartPre=.*linux-ensure-console-user/d')
         if [ "$console_user" != "root" ] && grep -q '^User=root' <<< "$new_content"; then
             new_content=$(printf '%s' "$new_content" | sed "s/^User=root/User=$console_user/")
             print_info "Patched betterdesk-console.service (User=$console_user)"
             changed=1
         fi
-        local node_path
-        node_path=$(command -v node 2>/dev/null || echo "/usr/bin/node")
-        if ! grep -q '^ExecStartPre=.*linux-ensure-console-user' <<< "$new_content"; then
-            new_content=$(printf '%s' "$new_content" | sed "s|^ExecStart=|ExecStartPre=+${node_path} ${CONSOLE_PATH}/scripts/linux-ensure-console-user.js\nExecStart=|")
-            print_info "Patched betterdesk-console.service (ExecStartPre permission sync)"
+        if [ "$new_content" != "$content" ] && grep -q '^ExecStartPre=.*linux-ensure-console-user' <<< "$content"; then
+            print_info "Removed unsafe root ExecStartPre permission hook from betterdesk-console.service"
             changed=1
         fi
         if [ "$new_content" != "$content" ]; then
@@ -3878,7 +4256,6 @@ Type=simple
 User=$console_user
 WorkingDirectory=$CONSOLE_PATH
 EnvironmentFile=-$CONSOLE_PATH/.env
-ExecStartPre=+$node_path $CONSOLE_PATH/scripts/linux-ensure-console-user.js
 ExecStart=$node_path server.js
 StandardOutput=journal
 StandardError=journal
@@ -4367,6 +4744,32 @@ read_update_github_branch_from_env() {
     fi
 }
 
+resolve_update_remote_sha() {
+    local clone_dir="$1"
+    local remote_sha=""
+
+    if command -v git &>/dev/null && [ -d "$clone_dir/.git" ]; then
+        remote_sha=$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null || true)
+    fi
+    if ! [[ "$remote_sha" =~ ^[0-9a-fA-F]{40}$ ]] && command -v git &>/dev/null; then
+        remote_sha=$(git ls-remote \
+            "https://github.com/${UPDATE_GITHUB_OWNER}/${UPDATE_GITHUB_REPO}.git" \
+            "refs/heads/${UPDATE_GITHUB_BRANCH}" 2>/dev/null | awk 'NR == 1 { print $1; exit }' || true)
+    fi
+    if ! [[ "$remote_sha" =~ ^[0-9a-fA-F]{40}$ ]] && command -v curl &>/dev/null; then
+        remote_sha=$(curl -fsSL --connect-timeout 15 --max-time 30 \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${UPDATE_GITHUB_OWNER}/${UPDATE_GITHUB_REPO}/commits?sha=${UPDATE_GITHUB_BRANCH}&per_page=1" \
+            2>/dev/null | awk -F'"' '/"sha"[[:space:]]*:/ { print $4; exit }' || true)
+    fi
+
+    if [[ "$remote_sha" =~ ^[0-9a-fA-F]{40}$ ]]; then
+        printf '%s\n' "$remote_sha"
+        return 0
+    fi
+    return 1
+}
+
 write_update_github_branch_to_env() {
     local branch="$1"
     local env_file="${CONSOLE_PATH:-}/.env"
@@ -4453,6 +4856,8 @@ run_terminal_project_update() {
 update_from_github() {
     local clone_dir="$UPDATE_CLONE_DIR"
     local server_build_failed=0
+    local previous_source_dir=""
+    local remote_sha=""
 
     read_update_github_branch_from_env
 
@@ -4496,6 +4901,13 @@ update_from_github() {
         return 1
     fi
 
+    if ! remote_sha=$(resolve_update_remote_sha "$clone_dir"); then
+        print_error "Could not resolve the downloaded commit SHA; refusing an untracked update"
+        rm -rf "$clone_dir"
+        return 1
+    fi
+    print_info "Downloaded commit: ${remote_sha:0:7}"
+
     # Read remote version
     local remote_version=""
     if [ -f "$clone_dir/VERSION" ]; then
@@ -4508,8 +4920,13 @@ update_from_github() {
     # ---- Step 2: Update Go server source & compile ----
     print_step "Updating Go server source..."
     if [ -d "$GO_SERVER_SOURCE" ]; then
-        # Backup existing source (lightweight — just rename)
-        mv "$GO_SERVER_SOURCE" "${GO_SERVER_SOURCE}.pre-update.$$" 2>/dev/null || true
+        # Keep the old tree until the new server has built successfully so a
+        # failed update can restore a known-good source tree.
+        previous_source_dir="${GO_SERVER_SOURCE}.pre-update.$$"
+        if ! mv "$GO_SERVER_SOURCE" "$previous_source_dir" 2>/dev/null; then
+            previous_source_dir=""
+            print_warning "Could not stage the previous Go source tree; update will continue in place"
+        fi
     fi
     # Copy the *contents* into a guaranteed-existing destination. Copying the
     # directory itself would nest the new tree inside an existing
@@ -4520,10 +4937,9 @@ update_from_github() {
     cp -rf "$clone_dir/betterdesk-server/." "$GO_SERVER_SOURCE/"
 
     # Restore any local data/ directory that existed in the old source dir
-    if [ -d "${GO_SERVER_SOURCE}.pre-update.$$/data" ]; then
-        cp -rn "${GO_SERVER_SOURCE}.pre-update.$$/data" "$GO_SERVER_SOURCE/" 2>/dev/null || true
+    if [ -n "$previous_source_dir" ] && [ -d "$previous_source_dir/data" ]; then
+        cp -rn "$previous_source_dir/data" "$GO_SERVER_SOURCE/" 2>/dev/null || true
     fi
-    rm -rf "${GO_SERVER_SOURCE}.pre-update.$$"
     print_success "Go server source updated"
 
     # Compile Go server
@@ -4533,7 +4949,7 @@ update_from_github() {
         if ! install_golang; then
             print_warning "Go toolchain not available — server binary not updated"
             print_info "Install Go manually from https://go.dev/dl/ and re-run update"
-            # Non-critical: source files were updated, binary can be built later
+            server_build_failed=1
         fi
     fi
 
@@ -4558,6 +4974,8 @@ update_from_github() {
             print_info "Use the panel Rebuild server binary button or option 7 (Build & deploy server)"
             server_build_failed=1
         fi
+    else
+        server_build_failed=1
     fi
 
     # ---- Step 3: Update Node.js console files ----
@@ -4647,10 +5065,12 @@ update_from_github() {
     # ---- Step 4: Update installer scripts ----
     print_step "Updating installer scripts..."
     local scripts_updated=0
-    for script_file in betterdesk.sh betterdesk.ps1 betterdesk-docker.sh \
+    for script_file in install.sh betterdesk.sh betterdesk.ps1 betterdesk-docker.sh \
                        docker-compose.yml docker-compose.single.yml docker-compose.quick.yml \
                        docker-compose.quick.single.yml docker-compose.quick.single.macvlan.yml \
-                       Dockerfile Dockerfile.server Dockerfile.console VERSION; do
+                       Dockerfile Dockerfile.server Dockerfile.console docker-entrypoint.sh \
+                       docker/entrypoint.sh docker/server-entrypoint.sh docker/console-entrypoint.sh \
+                       docker/supervisord.conf scripts/installer-protocol-check.js VERSION; do
         if [ -f "$clone_dir/$script_file" ]; then
             cp "$clone_dir/$script_file" "$SCRIPT_DIR/$script_file" 2>/dev/null || true
             if [[ "$script_file" == *.sh ]]; then
@@ -4661,33 +5081,33 @@ update_from_github() {
     done
     print_success "$scripts_updated installer files updated"
 
-    # ---- Step 5: Update SHA tracking for in-app updater ----
-    if command -v git &>/dev/null && [ -d "$clone_dir/.git" ]; then
-        local remote_sha
-        remote_sha=$(git -C "$clone_dir" rev-parse HEAD 2>/dev/null)
-        if [ -n "$remote_sha" ]; then
-            mkdir -p "$CONSOLE_PATH/data"
-            echo "$remote_sha" > "$CONSOLE_PATH/data/.update_sha"
-            echo "$remote_sha" > "$CONSOLE_PATH/data/.agent_source_sha"
-            rm -f "$CONSOLE_PATH/data/.last_update_result.json"
-            print_info "SHA tracking updated: ${remote_sha:0:7}"
+    if [ "$server_build_failed" -eq 1 ]; then
+        if [ -n "$previous_source_dir" ] && [ -d "$previous_source_dir" ]; then
+            rm -rf "$GO_SERVER_SOURCE"
+            mv "$previous_source_dir" "$GO_SERVER_SOURCE" 2>/dev/null || \
+                print_warning "Could not restore the previous Go source tree"
         fi
+        rm -rf "$clone_dir"
+        print_error "Go server binary was not rebuilt — update incomplete for server component"
+        return 1
     fi
 
-    # ---- Step 6: Update VERSION file in project root ----
+    # Only mark the update complete after the server build/deploy succeeded.
+    mkdir -p "$CONSOLE_PATH/data"
+    printf '%s\n' "$remote_sha" > "$CONSOLE_PATH/data/.update_sha"
+    printf '%s\n' "$remote_sha" > "$CONSOLE_PATH/data/.agent_source_sha"
+    rm -f "$CONSOLE_PATH/data/.last_update_result.json"
+    print_info "SHA tracking updated: ${remote_sha:0:7}"
+
     if [ -f "$clone_dir/VERSION" ] && [ -n "$remote_version" ]; then
         cp "$clone_dir/VERSION" "$SCRIPT_DIR/VERSION" 2>/dev/null || true
         cp "$clone_dir/VERSION" "$CONSOLE_PATH/VERSION" 2>/dev/null || true
     fi
-
-    # Cleanup
     rm -rf "$clone_dir"
-
-    print_success "All project files updated from GitHub"
-    if [ "$server_build_failed" -eq 1 ]; then
-        print_error "Go server binary was not rebuilt — update incomplete for server component"
-        return 1
+    if [ -n "$previous_source_dir" ]; then
+        rm -rf "$previous_source_dir"
     fi
+    print_success "All project files updated from GitHub"
     return 0
 }
 
@@ -4823,7 +5243,11 @@ do_update() {
                 maybe_update_services
                 prepare_console_after_update
                 maybe_create_admin_user_on_update
-                start_services_with_verification
+                if ! start_services_with_verification; then
+                    print_error "Local update applied but services did not start correctly"
+                    press_enter
+                    return 1
+                fi
                 print_success "Local update completed!"
                 reexec_installer_after_update
                 return
@@ -4844,9 +5268,11 @@ do_update() {
     if ! update_from_github; then
         print_error "GitHub update failed"
         print_info "Attempting to restart services with existing files..."
-        start_services_with_verification
+        if ! start_services_with_verification; then
+            print_error "Could not restart services after failed update"
+        fi
         press_enter
-        return
+        return 1
     fi
 
     # Run database migrations (adds missing columns etc.)
@@ -4864,11 +5290,17 @@ do_update() {
     # Patch existing units or create missing; optional full recreate (issue #158)
     maybe_update_services "$svc_mode"
 
-    prepare_console_after_update
+    prepare_console_after_update || print_warning "Console prep after update reported issues"
     maybe_create_admin_user_on_update
 
-    # Start services with verification
-    start_services_with_verification
+    # Start services with verification (#306 — do not claim success if Console is down)
+    if ! start_services_with_verification; then
+        print_error "Update files applied but services did not start correctly"
+        print_info "Fix Console with: sudo systemctl start betterdesk-console"
+        print_info "Logs: journalctl -u betterdesk-console -n 50 --no-pager"
+        press_enter
+        return 1
+    fi
     
     print_success "Update completed!"
     if [ -n "${remote_version:-}" ]; then
@@ -5085,10 +5517,8 @@ repair_permissions() {
         if [ -f "$CONSOLE_PATH/scripts/linux-ensure-console-user.js" ] && command -v node &>/dev/null; then
             if [ "$(id -u)" -eq 0 ]; then
                 node "$CONSOLE_PATH/scripts/linux-ensure-console-user.js" || print_warning "Console permission script reported issues"
-            elif command -v sudo &>/dev/null && sudo -n true 2>/dev/null; then
-                sudo -n node "$CONSOLE_PATH/scripts/linux-ensure-console-user.js" || print_warning "Console permission script reported issues"
             else
-                print_warning "Console permission sync skipped (run as root: sudo node $CONSOLE_PATH/scripts/linux-ensure-console-user.js)"
+                print_warning "Console permission sync skipped; run linux-ensure-console-user.js as root"
             fi
         fi
         repair_https_stuck_state yes
@@ -6384,11 +6814,13 @@ do_uninstall() {
     print_warning "This operation will remove BetterDesk Console!"
     echo ""
     
-    if ! confirm "Are you sure you want to continue?"; then
-        return
+    if [ "$AUTO_MODE" != true ] && [ "$UNINSTALL_MODE" != true ]; then
+        if ! confirm "Are you sure you want to continue?"; then
+            return
+        fi
     fi
     
-    if confirm "Create backup before uninstall?"; then
+    if [ "$AUTO_MODE" = true ] || confirm "Create backup before uninstall?"; then
         do_backup_silent
     fi
     
@@ -6412,14 +6844,18 @@ do_uninstall() {
     rm -f /etc/systemd/system/betterdesk-go.service
     systemctl daemon-reload
     
-    if confirm "Remove installation files ($RUSTDESK_PATH)?"; then
+    if [ "$PURGE_MODE" = true ] || { [ "$AUTO_MODE" != true ] && confirm "Remove installation files ($RUSTDESK_PATH)?"; }; then
         rm -rf "$RUSTDESK_PATH"
         print_info "Removed: $RUSTDESK_PATH"
+    else
+        print_info "Preserved server data: $RUSTDESK_PATH"
     fi
     
-    if confirm "Remove Web Console ($CONSOLE_PATH)?"; then
+    if [ "$PURGE_MODE" = true ] || { [ "$AUTO_MODE" != true ] && confirm "Remove Web Console ($CONSOLE_PATH)?"; }; then
         rm -rf "$CONSOLE_PATH"
         print_info "Removed: $CONSOLE_PATH"
+    else
+        print_info "Preserved console data: $CONSOLE_PATH"
     fi
     
     print_success "BetterDesk has been uninstalled"
@@ -7518,7 +7954,9 @@ main() {
     # Auto mode - run installation directly
     if [ "$AUTO_MODE" = true ]; then
         print_info "Running in AUTO mode..."
-        if [ "$MINIMAL_MODE" = true ]; then
+        if [ "$UNINSTALL_MODE" = true ]; then
+            do_uninstall
+        elif [ "$MINIMAL_MODE" = true ]; then
             do_install_minimal
         else
             do_install

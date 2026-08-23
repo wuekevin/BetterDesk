@@ -862,15 +862,30 @@
             session.passwordOverlay.style.display = 'flex';
             session.loginError.style.display = 'none';
             session.passwordInput.value = '';
-            if (window.RdClientSecureStore && session.deviceId) {
-                window.RdClientSecureStore.loadPeerPassword(session.deviceId).then(function (saved) {
-                    if (saved) {
-                        session.passwordInput.value = saved;
-                        if (session.rememberPeerCheckbox) session.rememberPeerCheckbox.checked = true;
-                    }
-                }).catch(function () { /* ignore */ });
-            }
-            if (isActive(session)) session.passwordInput.focus();
+            var applySaved = function (saved) {
+                if (saved) {
+                    session.passwordInput.value = saved;
+                    if (session.rememberPeerCheckbox) session.rememberPeerCheckbox.checked = true;
+                }
+                if (isActive(session)) session.passwordInput.focus();
+            };
+            var localPromise = (window.RdClientSecureStore && session.deviceId)
+                ? window.RdClientSecureStore.loadPeerPassword(session.deviceId).catch(function () { return ''; })
+                : Promise.resolve('');
+            var orgPromise = session.deviceId
+                ? fetch('/api/devices/' + encodeURIComponent(session.deviceId) + '/connect-password', {
+                    credentials: 'same-origin',
+                    headers: { 'Accept': 'application/json' }
+                }).then(function (r) {
+                    if (!r.ok) return '';
+                    return r.json().then(function (body) {
+                        return (body && body.password) ? String(body.password) : '';
+                    });
+                }).catch(function () { return ''; })
+                : Promise.resolve('');
+            Promise.all([localPromise, orgPromise]).then(function (pair) {
+                applySaved(pair[0] || pair[1] || '');
+            });
             if (isActive(session)) setToolbarChromeVisible(false);
         });
 
@@ -1254,10 +1269,10 @@
     function applyTransportCapabilities() {
         const fileBtn = document.getElementById('btn-file-transfer');
         if (fileBtn && getTransportName() === 'cdap') {
-            fileBtn.disabled = true;
-            fileBtn.classList.add('disabled');
-            fileBtn.title = t('remote.file_transfer_unavailable_cdap',
-                'File transfer is not available for CDAP snapshot sessions.');
+            // CDAP file transfer is wired via CDAPFileTransfer + /files WS.
+            fileBtn.disabled = false;
+            fileBtn.classList.remove('disabled');
+            fileBtn.title = t('remote.file_transfer', 'File transfer');
         }
         applyGuestUiLockdown();
     }
@@ -1659,7 +1674,6 @@
     document.getElementById('btn-file-transfer')?.addEventListener('click', function () {
         const session = getActiveSession();
         if (!session || !session.client?.fileTransfer) return;
-        if (getTransportName() === 'cdap') return;
         const modal = window.__fileTransferModal;
         if (!modal) return;
         if (modal.isOpen()) {

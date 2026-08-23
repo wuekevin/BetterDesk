@@ -29,6 +29,12 @@ const ALLOWED_PATHS = new Set([
     '/api/logout',
     '/api/currentUser',
     '/api/login-options',
+    // OIDC for stock RustDesk desktop client (#304)
+    '/api/oidc/auth',
+    '/api/oidc/auth-query',
+    '/api/oidc/callback',
+    // Same IdP redirect family as panel SSO (browser hits API origin)
+    '/api/auth/oidc/callback',
     // Phase 1: Core integration
     '/api/heartbeat',
     '/api/sysinfo',
@@ -56,6 +62,8 @@ const ALLOWED_PATHS = new Set([
     '/api/software',
     '/api/software/client-download-link',
     // Security: server key distribution
+    '/api/health',
+    '/api/server/pubkey',
     '/api/server-key',
     '/api/server-key/fingerprint',
     // RustDesk PRO group endpoints (Flutter client queries after login)
@@ -83,6 +91,10 @@ const ALLOWED_METHODS = {
     '/api/logout': 'POST',
     '/api/currentUser': 'GET',
     '/api/login-options': 'GET',
+    '/api/oidc/auth': 'POST',
+    '/api/oidc/auth-query': 'GET',
+    '/api/oidc/callback': 'GET',
+    '/api/auth/oidc/callback': 'GET',
     '/api/heartbeat': 'POST',
     '/api/sysinfo': 'POST',
     '/api/sysinfo_ver': 'POST',
@@ -104,6 +116,8 @@ const ALLOWED_METHODS = {
     '/api/users': 'GET',
     '/api/software': 'GET',
     '/api/software/client-download-link': 'GET',
+    '/api/health': 'GET',
+    '/api/server/pubkey': 'GET',
     '/api/server-key': 'GET',
     '/api/server-key/fingerprint': 'GET',
     '/api/group': '*',
@@ -119,6 +133,7 @@ const ALLOWED_METHODS = {
  */
 const PATH_BODY_LIMITS = {
     '/api/login': 4096,           // 4KB — login with deviceInfo payload
+    '/api/oidc/auth': 4096,       // 4KB — OIDC start with deviceInfo
     '/api/sysinfo': 8192,         // 8KB — sysinfo with displays/encoding data
     '/api/sysinfo_ver': 512,      // 512B — version check (id + hash only)
     '/api/ab': 524288,             // 512KB — match Go address book limit

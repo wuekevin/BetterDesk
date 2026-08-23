@@ -209,6 +209,8 @@ Or containers fail to start with permission errors when using bind mounts.
 ### Cause
 SELinux-enabled systems (AlmaLinux, RHEL, CentOS, Rocky Linux) require special volume mount options or SELinux context changes for bind mounts.
 
+On Synology / NAS bind mounts, host folders are often owned by DSM UIDs that are **not** the image default `10001:10001`. Prefer setting `PUID`/`PGID` (see below) rather than Compose `user:`.
+
 ### ✅ Solutions
 
 **Option 1: Use Named Volumes (recommended)**
@@ -220,7 +222,19 @@ volumes:
   - console-data:/app/data         # Named volume - SELinux compatible
 ```
 
-**Option 2: Add `:z` flag for Bind Mounts**
+**Option 2: Set PUID/PGID for bind mounts (#376)**
+
+Map the in-container `betterdesk` user to the host directory owner (linuxserver-style). Defaults remain `10001:10001`.
+
+```yaml
+environment:
+  - PUID=1000013
+  - PGID=1000001
+```
+
+Restart the stack after changing these values so the entrypoint can remount ownership. Avoid Compose `user:` — it interferes with `su-exec`.
+
+**Option 3: Add `:z` flag for Bind Mounts (SELinux)**
 
 If you must use bind mounts (host paths), add the `:z` suffix:
 ```yaml
@@ -229,7 +243,7 @@ volumes:
   - /opt/console-data:/app/data:z
 ```
 
-**Option 3: Apply SELinux Context Manually**
+**Option 4: Apply SELinux Context Manually**
 ```bash
 # Apply container-compatible SELinux context to directories
 sudo chcon -Rt svirt_sandbox_file_t /path/to/data/directory
@@ -239,7 +253,7 @@ sudo chcon -Rt svirt_sandbox_file_t /opt/betterdesk
 sudo chcon -Rt svirt_sandbox_file_t /opt/console-data
 ```
 
-**Option 4: Temporarily Disable SELinux (not recommended for production)**
+**Option 5: Temporarily Disable SELinux (not recommended for production)**
 ```bash
 # Set SELinux to permissive mode temporarily
 sudo setenforce 0
@@ -304,8 +318,7 @@ cursor.execute('''
         role VARCHAR(20) NOT NULL DEFAULT 'viewer',
         created_at DATETIME NOT NULL,
         last_login DATETIME,
-        is_active BOOLEAN NOT NULL DEFAULT 1,
-        CHECK (role IN ('admin', 'operator', 'viewer'))
+        is_active BOOLEAN NOT NULL DEFAULT 1
     )
 ''')
 
@@ -428,6 +441,130 @@ docker compose exec -u betterdesk console sh -c 'cat /opt/rustdesk/.admin_creden
 **Do not** run `chmod 777` on the credentials file — that makes the bootstrap password world-readable.
 
 If no file is found yet, wait for first boot to finish and check `docker compose logs server` for the bootstrap message.
+
+### Problem: `betterdesk-show-admin-credentials: executable file not found`
+
+**Symptom:** After `install.sh` or `docker compose exec … betterdesk-show-admin-credentials`:
+
+```text
+OCI runtime exec failed: exec failed: … executable file not found in $PATH
+```
+
+**Cause:** The running image is older than the helper (#195 / 3.2.17+). `install.sh` used to pin a stale default tag while compose defaults moved ahead (#299).
+
+**Fix:**
+
+```bash
+# Pull the current tag (match VERSION / compose default), then recreate:
+cd /opt/betterdesk/docker   # or your compose directory
+# Ensure .env has BETTERDESK_IMAGE_TAG=<current VERSION>, e.g. 3.5.37
+docker compose pull && docker compose up -d
+
+# Official single-container service name:
+docker compose exec betterdesk betterdesk-show-admin-credentials
+
+# Until you can pull a newer image:
+docker compose exec -u betterdesk betterdesk \
+  sh -c 'cat /opt/rustdesk/.admin_credentials 2>/dev/null || cat /app/data/.admin_credentials'
+```
+
+For the legacy two-container layout, replace `betterdesk` with `console`.
+
+### Problem: Password reset says `No such container: betterdesk-console`
+
+**Symptom:** `betterdesk-docker.sh` → reset admin password fails with:
+
+```text
+Error response from daemon: No such container: betterdesk-console
+```
+
+**Cause:** Official install uses the all-in-one container named `betterdesk`. Older script paths always exec'd `betterdesk-console` (#299).
+
+**Fix:** Update to a build that includes `resolve_panel_container`, or reset manually:
+
+```bash
+docker exec betterdesk node /app/scripts/reset-password.js 'YourNewPassword' admin
+```
+
+### Problem: Split layout console exits with `SQLITE_READONLY` / `readonly database`
+
+**Symptom:** `betterdesk-console` logs:
+
+```text
+Failed to start server: SqliteError: attempt to write a readonly database
+```
+
+**Cause:** Legacy `docker-compose.quick.yml` briefly pointed `DB_PATH` at `/app/data/db_v2.sqlite3` on the console volume while the Go server mounts that volume read-only for `auth.db` sync — wrong path for the shared peer DB (#299).
+
+**Fix:** Use current `docker-compose.quick.yml` (`DB_PATH=/opt/rustdesk/db_v2.sqlite3`), then:
+
+```bash
+docker compose pull && docker compose up -d
+```
+
+Fresh volumes are simplest. If you already wrote peers only into an orphan `/app/data/db_v2.sqlite3`, copy it into the shared Go data volume at `/opt/rustdesk/db_v2.sqlite3` before recreating, or re-enroll devices.
+
+### Problem: All-in-one exits with `ENV_NTP_SERVERS` / supervisord format string error
+
+**Symptom:** Fresh AIO container logs end with:
+
+```text
+Error: Format string '…NTP_SERVERS="%(ENV_NTP_SERVERS)s"…' for 'environment'
+contains names ('ENV_NTP_SERVERS') which cannot be expanded.
+```
+
+**Cause:** `supervisord.conf` interpolates billing/NTP env vars for the Go server. Older images / Portainer stacks / bare `docker run` that omit `NTP_SERVERS`, `BILLING_MAX_CLOCK_SKEW_MS`, `BILLING_REQUIRE_SYNCED_CLOCK`, and `BILLING_TRUST_OS_NTP` crash at supervisord parse time (#299).
+
+**Fix (current images):** entrypoint and Dockerfile supply defaults — pull/rebuild the AIO image and recreate the container.
+
+**Workaround (until you can update the image):** add the vars to your compose/stack (official `docker-compose.quick.single.yml` already includes them), then:
+
+```bash
+cd /opt/betterdesk/docker   # or your compose directory
+docker compose up -d --force-recreate
+```
+
+Or for a one-off:
+
+```bash
+docker run ... \
+  -e NTP_SERVERS=pool.ntp.org,time.google.com,time.cloudflare.com \
+  -e BILLING_MAX_CLOCK_SKEW_MS=2000 \
+  -e BILLING_REQUIRE_SYNCED_CLOCK=1 \
+  -e BILLING_TRUST_OS_NTP=Y \
+  ghcr.io/unitronix/betterdesk:<tag>
+```
+
+### Problem: Browser shows `SSL_ERROR_RX_RECORD_TOO_LONG` (or Chrome “ERR_SSL_PROTOCOL_ERROR”)
+
+**Symptom:** After a fresh Docker install or `docker compose pull`, Firefox Advanced details show:
+
+```text
+SSL_ERROR_RX_RECORD_TOO_LONG
+The page you are trying to view cannot be shown because the authenticity
+of the received data could not be verified.
+```
+
+Chrome/Edge often report `ERR_SSL_PROTOCOL_ERROR` for the same case.
+
+**Cause:** The browser used **HTTPS** against a port that speaks plain **HTTP**. Official GHCR quick-start / all-in-one images serve the web panel as **HTTP on port 5000** by default (`HTTPS_ENABLED` is off). Common triggers (#299):
+
+- Opening `https://<host>:5000` (bookmark, autocomplete, Portainer “Open”)
+- Mapping host **443 → container 5000** and browsing `https://…` without a TLS terminator
+- A reverse proxy that forwards TLS to the panel without terminating SSL
+
+**Fix:**
+
+1. Use **`http://<host>:5000`** (not `https://`).
+2. Confirm the panel is up over HTTP:
+   ```bash
+   curl -v http://127.0.0.1:5000/health
+   docker compose logs --tail=80
+   ```
+   Expect a healthy HTTP response and a startup banner showing **HTTP**.
+3. Correct Portainer / compose port maps so host 443 is not pointed at the plain-HTTP panel port unless a proxy terminates TLS.
+
+**If you need TLS:** put nginx / Traefik / Caddy in front, or enable panel HTTPS (`HTTPS_ENABLED` + certs) — see [DOCKER_QUICKSTART — SSL/TLS](DOCKER_QUICKSTART.md#ssltls) and [HTTPS_SETUP.md](../setup/HTTPS_SETUP.md).
 
 ### Problem: "Database not found"
 ```bash
