@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - build/betterdesk-3.5.55-all
+  pull_request:
+    branches:
+      - dev
   workflow_dispatch:
 
 permissions:
