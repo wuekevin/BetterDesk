@@ -158,9 +158,12 @@ def package_windows(bundle: Path) -> list[Path]:
                 wix,
                 "build",
                 str(ROOT / "packaging" / "windows" / "BetterDesk.wxs"),
-                f"-dAppDir={stage}",
-                f"-dProductVersion={VERSION}",
-                f"-o{msi}",
+                "-d",
+                f"AppDir={stage}",
+                "-d",
+                f"ProductVersion={VERSION}",
+                "-o",
+                str(msi),
             ],
         )
         output.append(msi)
