@@ -4,8 +4,12 @@
 //! writes a short-lived authorization result to a random marker in the
 //! user's temporary directory, and exits.
 
-use std::{env, fs, path::Path, process};
+use std::process;
 
+#[cfg(windows)]
+use std::{env, fs, path::Path};
+
+#[cfg(windows)]
 use betterdesk_desktop::helper::allowlisted_name;
 
 fn main() {
